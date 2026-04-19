@@ -167,7 +167,7 @@ sequenceDiagram
     end
 
     P->>P: translate request<br/>• strip max_tokens / temperature / cache_control<br/>• system blocks → top-level "instructions"<br/>• tool_use.id = call_id (identity)<br/>• prompt_cache_key = session id
-    P->>CGX: POST /responses<br/>Bearer + ChatGPT-Account-Id + originator
+    P->>CGX: POST /responses<br/>Bearer + ChatGPT-Account-Id + originator=claude-codex-proxy
     CGX-->>P: Responses API SSE<br/>(output_item.*, output_text.delta, function_call_arguments.*, codex.rate_limits, response.completed)
     P->>P: reducer: typed events<br/>(text/tool start/delta/stop, finish)
     P-->>CC: Anthropic SSE<br/>(message_start, content_block_*, message_delta, message_stop)
