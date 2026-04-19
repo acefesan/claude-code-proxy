@@ -199,8 +199,14 @@ install_from_release() {
 		sudo mv -f "$tmp_binary" "$install_dir/${BIN_NAME}"
 	fi
 
-	if [[ "$(uname -s)" == "Darwin" ]] && command -v xattr &>/dev/null; then
-		xattr -d com.apple.quarantine "$install_dir/${BIN_NAME}" 2>/dev/null || true
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		if command -v xattr &>/dev/null; then
+			xattr -d com.apple.quarantine "$install_dir/${BIN_NAME}" 2>/dev/null || true
+		fi
+		if command -v codesign &>/dev/null; then
+			codesign --remove-signature "$install_dir/${BIN_NAME}" 2>/dev/null || true
+			codesign --sign - --force "$install_dir/${BIN_NAME}" 2>/dev/null || true
+		fi
 	fi
 
 	log_success "${BIN_NAME} installed to $install_dir/${BIN_NAME}"
