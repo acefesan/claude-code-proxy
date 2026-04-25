@@ -1,11 +1,11 @@
-import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi"
+import { dlopen, FFIType, ptr, toArrayBuffer, type Pointer } from "bun:ffi"
 
 const errSecSuccess = 0
 const errSecItemNotFound = -25300
 const errSecDuplicateItem = -25299
 
-function readPtr(buf: Uint8Array): number {
-  return Number(new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true))
+function readPtr(buf: Uint8Array): Pointer {
+  return Number(new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true)) as unknown as Pointer
 }
 
 let _sym: ReturnType<typeof loadLib>["symbols"] | undefined
