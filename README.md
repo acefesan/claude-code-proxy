@@ -107,6 +107,7 @@ ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.4[1m] \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
 # Kimi
@@ -115,8 +116,15 @@ ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=kimi-for-coding[1m] \
 ANTHROPIC_SMALL_FAST_MODEL=kimi-for-coding[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 ```
+
+`CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` is recommended because the
+proxy always talks to upstream providers with streaming requests, even when it
+accumulates a non-streaming Anthropic response for Claude Code. Disabling Claude
+Code's streaming-to-non-streaming fallback avoids retrying a partially completed
+stream in a way that can duplicate tool calls.
 
 Or set it persistently in `~/.claude/settings.json`:
 
@@ -127,7 +135,8 @@ Or set it persistently in `~/.claude/settings.json`:
     "ANTHROPIC_AUTH_TOKEN": "unused",
     "ANTHROPIC_MODEL": "gpt-5.4[1m]",
     "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini[1m]",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
+    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
   }
 }
 ```
@@ -169,6 +178,7 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
     export ANTHROPIC_MODEL="gpt-5.4[1m]"
     export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini[1m]"
     export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+    export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1"
 fi
 
 exec "$HOME/.local/bin/claude" "$@"
