@@ -48,7 +48,7 @@ describe("config defaults", () => {
     expect(codexEffort()).toBeUndefined()
     expect(codexServiceTier()).toBeUndefined()
     expect(codexBaseUrl("default-codex-url")).toBe("default-codex-url")
-    expect(aliasProvider()).toBe("kimi")
+    expect(aliasProvider()).toBe("codex")
     expect(kimiUserAgent("default-kimi-ua")).toBe("default-kimi-ua")
     expect(kimiOauthHost()).toBe("https://auth.kimi.com")
     expect(kimiBaseUrl()).toBe("https://api.kimi.com/coding/v1")
@@ -242,7 +242,7 @@ describe("malformed config", () => {
   it("ignores invalid aliasProvider values", () => {
     writeFileSync(configPath, JSON.stringify({ aliasProvider: "openai" }))
     setEnv({})
-    expect(aliasProvider()).toBe("kimi")
+    expect(aliasProvider()).toBe("codex")
   })
 
   it("returns defaults when file is missing entirely", () => {

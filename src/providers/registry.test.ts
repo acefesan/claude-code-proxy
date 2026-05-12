@@ -28,17 +28,19 @@ describe("provider routing", () => {
     expect(providerForModel(model)?.name).toBe("codex")
   })
 
-  it("routes Anthropic-style aliases to Kimi by default", () => {
+  it("routes Anthropic-style aliases to Codex by default", () => {
     loadConfig({ env: {}, forceReload: true })
-
-    expect(providerForModel("sonnet")?.name).toBe("kimi")
-  })
-
-  it("routes every Anthropic-style alias to Codex when env selects Codex", () => {
-    loadConfig({ env: { CCP_ALIAS_PROVIDER: "codex" }, forceReload: true })
 
     for (const alias of ANTHROPIC_STYLE_ALIASES) {
       expect(providerForModel(alias)?.name).toBe("codex")
+    }
+  })
+
+  it("routes every Anthropic-style alias to Kimi when env selects Kimi", () => {
+    loadConfig({ env: { CCP_ALIAS_PROVIDER: "kimi" }, forceReload: true })
+
+    for (const alias of ANTHROPIC_STYLE_ALIASES) {
+      expect(providerForModel(alias)?.name).toBe("kimi")
     }
   })
 

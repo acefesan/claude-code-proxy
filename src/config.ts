@@ -225,7 +225,7 @@ export function codexBaseUrl(defaultValue: string): string {
 
 export function aliasProvider(): AliasProvider {
   const c = getConfig()
-  return parseAliasProvider("CCP_ALIAS_PROVIDER", emptyOrUnset(c.env.CCP_ALIAS_PROVIDER)) ?? c.file.aliasProvider ?? "kimi"
+  return parseAliasProvider("CCP_ALIAS_PROVIDER", emptyOrUnset(c.env.CCP_ALIAS_PROVIDER)) ?? c.file.aliasProvider ?? "codex"
 }
 
 export function kimiUserAgent(defaultValue: string): string {
