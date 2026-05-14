@@ -39,8 +39,8 @@ curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/script
 
 **Manual:** download a prebuilt binary for your platform from the
 [releases page](https://github.com/raine/claude-code-proxy/releases). Windows
-artifacts are published as `claude-code-proxy-windows-amd64.tar.gz` and
-`claude-code-proxy-windows-arm64.tar.gz`; extract the `.exe` somewhere on your
+artifacts are published as `claude-code-proxy-windows-amd64.zip` and
+`claude-code-proxy-windows-arm64.zip`; extract the `.exe` somewhere on your
 `PATH`.
 
 ### 2. Pick a provider and authenticate
