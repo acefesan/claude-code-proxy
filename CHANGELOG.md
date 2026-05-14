@@ -3,8 +3,6 @@
 ## v0.0.13 (2026-05-14)
 
 - Windows users can now download prebuilt `windows-amd64` and `windows-arm64` release archives.
-- Windows installs now store configuration, credentials, device IDs, and logs in the expected AppData locations.
-- The `serve` command now prints the exact log file path for the current platform.
 
 ## v0.0.12 (2026-05-12)
 
