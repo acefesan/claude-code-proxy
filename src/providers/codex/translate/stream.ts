@@ -39,7 +39,7 @@ export function translateStream(
   const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      const activeTools = new Map<number, { id: string; name: string }>();
+      const openBlocks = new Map<number, { type: "text" | "tool"; id?: string; name?: string }>();
       const diagnostics = createUpstreamStreamDiagnostics();
       let closed = false;
       let messageStarted = false;
@@ -75,12 +75,24 @@ export function translateStream(
         if (!messageStarted || Date.now() - lastEmitAt < KEEPALIVE_INTERVAL_MS) return;
         emit("ping", { type: "ping" });
       };
+      const activeToolCalls = () =>
+        Array.from(openBlocks.values()).filter(
+          (block): block is { type: "tool"; id: string; name: string } =>
+            block.type === "tool" && typeof block.id === "string" && typeof block.name === "string",
+        );
+      const closeOpenBlocks = () => {
+        for (const [index] of openBlocks) {
+          emit("content_block_stop", { type: "content_block_stop", index });
+        }
+        openBlocks.clear();
+      };
       const logWatchdog = () => {
-        const activeToolCalls = Array.from(activeTools.values());
+        const tools = activeToolCalls();
         opts.log.info("codex stream watchdog", {
           elapsedMs: Date.now() - startedAt,
-          activeToolNames: activeToolCalls.map((tool) => tool.name),
-          activeToolCalls,
+          activeToolNames: tools.map((tool) => tool.name),
+          activeToolCalls: tools,
+          openBlocks: Array.from(openBlocks.entries(), ([index, block]) => ({ index, ...block })),
           messageStarted,
           lastReducerEvent,
           lastEmitEvent,
@@ -118,6 +130,7 @@ export function translateStream(
           lastReducerEvent = e.kind;
           switch (e.kind) {
             case "text-start":
+              openBlocks.set(e.index, { type: "text" });
               ensureMessageStart();
               emit("content_block_start", {
                 type: "content_block_start",
@@ -133,10 +146,11 @@ export function translateStream(
               });
               break;
             case "text-stop":
+              openBlocks.delete(e.index);
               emit("content_block_stop", { type: "content_block_stop", index: e.index });
               break;
             case "tool-start":
-              activeTools.set(e.index, { id: e.id, name: e.name });
+              openBlocks.set(e.index, { type: "tool", id: e.id, name: e.name });
               ensureMessageStart();
               emit("content_block_start", {
                 type: "content_block_start",
@@ -161,10 +175,13 @@ export function translateStream(
               emitPingIfStale();
               break;
             case "tool-stop":
-              activeTools.delete(e.index);
+              openBlocks.delete(e.index);
               emit("content_block_stop", { type: "content_block_stop", index: e.index });
               break;
             case "finish":
+              if (openBlocks.size) {
+                throw new UpstreamStreamError("failed", "Stream finished with open content blocks");
+              }
               ensureMessageStart();
               opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage });
               emit("message_delta", {
@@ -177,13 +194,18 @@ export function translateStream(
           }
         }
       } catch (err) {
-        const activeToolNames = Array.from(activeTools.values(), (tool) => tool.name);
-        const activeToolCalls = Array.from(activeTools.values());
+        const activeToolCalls = Array.from(openBlocks.values()).filter(
+          (block): block is { type: "tool"; id: string; name: string } =>
+            block.type === "tool" && typeof block.id === "string" && typeof block.name === "string",
+        );
+        const activeToolNames = activeToolCalls.map((tool) => tool.name);
+        const openBlockDetails = Array.from(openBlocks.entries(), ([index, block]) => ({ index, ...block }));
         if (opts.signal?.aborted) {
           opts.log.info("stream cancelled", {
             err: describeError(err),
             activeToolNames,
             activeToolCalls,
+            openBlocks: openBlockDetails,
             diagnostics: describeDiagnostics(diagnostics),
           });
           return;
@@ -194,6 +216,7 @@ export function translateStream(
             message: err.message,
             activeToolNames,
             activeToolCalls,
+            openBlocks: openBlockDetails,
             clientAborted: opts.signal?.aborted ?? false,
             diagnostics: describeDiagnostics(diagnostics),
             upstreamHeaders: describeHeaders(opts.upstreamHeaders),
@@ -201,6 +224,7 @@ export function translateStream(
           const diagnosticFile = await writeDiagnosticFile(opts.reqId, "upstream-stream-error", detail);
           opts.log.warn("upstream stream error", { ...detail, diagnosticFile });
           ensureMessageStart();
+          closeOpenBlocks();
           emit("error", {
             type: "error",
             error: {
@@ -213,6 +237,7 @@ export function translateStream(
             err: describeError(err),
             activeToolNames,
             activeToolCalls,
+            openBlocks: openBlockDetails,
             clientAborted: opts.signal?.aborted ?? false,
             diagnostics: describeDiagnostics(diagnostics),
             upstreamHeaders: describeHeaders(opts.upstreamHeaders),
@@ -220,6 +245,7 @@ export function translateStream(
           const diagnosticFile = await writeDiagnosticFile(opts.reqId, "stream-translation-error", detail);
           opts.log.error("stream translation error", { ...detail, diagnosticFile });
           ensureMessageStart();
+          closeOpenBlocks();
           emit("error", {
             type: "error",
             error: { type: "api_error", message: String(err) },

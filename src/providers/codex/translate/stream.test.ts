@@ -36,6 +36,20 @@ function abortingUpstream(err: Error): ReadableStream<Uint8Array> {
   });
 }
 
+function upstreamThatErrorsAfterChunks(chunks: string[], err: Error): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  let index = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index >= chunks.length) {
+        controller.error(err);
+        return;
+      }
+      controller.enqueue(encoder.encode(chunks[index++]));
+    },
+  });
+}
+
 async function collect(stream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -96,6 +110,10 @@ describe("translateStream", () => {
         }),
         sse("keepalive", {}),
         sse("keepalive", {}),
+        sse("response.output_item.done", {
+          output_index: 0,
+          item: { type: "message", id: "msg_upstream" },
+        }),
         sse("response.completed", { response: { usage: {} } }),
       ];
 
@@ -109,6 +127,86 @@ describe("translateStream", () => {
 
       expect(output.match(/event: ping/g)?.length).toBeGreaterThanOrEqual(2);
       expect(output).toContain("event: message_stop");
+    } finally {
+      Date.now = realNow;
+      now = 0;
+    }
+  });
+
+  it("emits an error instead of message_stop when upstream ends with an open Read block", async () => {
+    const chunks = [
+      sse("response.output_item.added", {
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_read", name: "Read" },
+      }),
+      sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
+      sse("response.function_call_arguments.delta", { output_index: 0, delta: ":\"/tmp/a\"" }),
+    ];
+
+    const output = await collect(
+      translateStream(upstreamFromChunks(chunks), {
+        messageId: "msg_1",
+        model: "gpt-5.5",
+        log: silentLog,
+      }),
+    );
+
+    expect(output).toContain("event: content_block_start");
+    expect(output).toContain("event: content_block_stop");
+    expect(output).toContain("event: error");
+    expect(output).toContain("Upstream stream ended without a terminal response event");
+    expect(output).not.toContain("input_json_delta");
+    expect(output).not.toContain("event: message_stop");
+  });
+
+  it("closes an active Read block before non-client upstream errors", async () => {
+    const chunks = [
+      sse("response.output_item.added", {
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_read", name: "Read" },
+      }),
+      sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
+    ];
+    const err = new DOMException("The connection was closed.", "AbortError");
+
+    const output = await collect(
+      translateStream(upstreamThatErrorsAfterChunks(chunks, err), {
+        messageId: "msg_1",
+        model: "gpt-5.5",
+        log: silentLog,
+      }),
+    );
+
+    expect(output.indexOf("event: content_block_stop")).toBeLessThan(output.indexOf("event: error"));
+    expect(output).toContain("event: error");
+    expect(output).not.toContain("input_json_delta");
+  });
+
+  it("fails buffered Read arguments that exceed the safe duration", async () => {
+    Date.now = () => now;
+    try {
+      const chunks = [
+        sse("response.output_item.added", {
+          output_index: 0,
+          item: { type: "function_call", call_id: "call_read", name: "Read" },
+        }),
+        sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
+        sse("response.function_call_arguments.delta", { output_index: 0, delta: ":\"/tmp/a\"" }),
+      ];
+
+      const output = await collect(
+        translateStream(upstreamFromChunks(chunks, 121_000), {
+          messageId: "msg_1",
+          model: "gpt-5.5",
+          log: silentLog,
+        }),
+      );
+
+      expect(output).toContain("Buffered Read tool arguments exceeded safe limits");
+      expect(output).toContain("event: content_block_stop");
+      expect(output).toContain("event: error");
+      expect(output).not.toContain("input_json_delta");
+      expect(output).not.toContain("event: message_stop");
     } finally {
       Date.now = realNow;
       now = 0;

@@ -222,6 +222,10 @@ function isAbortError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
 }
 
+function isClosedControllerError(err: unknown): boolean {
+  return err instanceof TypeError && err.message.includes("Controller is already closed");
+}
+
 function wrapStreamResponse(
   resp: Response,
   reqId: string,
@@ -230,26 +234,54 @@ function wrapStreamResponse(
 ): Response {
   const body = resp.body!;
   const reader = body.getReader();
+  let closed = false;
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
+      if (closed) return;
+      const safeClose = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {}
+      };
+      const safeError = (err: unknown) => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.error(err);
+        } catch {}
+      };
       try {
         const { done, value } = await reader.read();
+        if (closed) return;
         if (done) {
           log.info("request_completed", { reqId, status: resp.status, ms: Date.now() - start });
-          controller.close();
+          safeClose();
           return;
         }
-        controller.enqueue(value);
+        try {
+          controller.enqueue(value);
+        } catch (err) {
+          if (!isClosedControllerError(err)) {
+            log.error("stream error", { reqId, err: String(err) });
+            reader.cancel().catch(() => {});
+            safeError(err);
+          } else {
+            closed = true;
+          }
+        }
       } catch (err) {
-        if (isAbortError(err)) {
+        if (isAbortError(err) || isClosedControllerError(err)) {
           log.info("client disconnected", { reqId, ms: Date.now() - start });
         } else {
           log.error("stream error", { reqId, err: String(err) });
         }
-        controller.error(err);
+        safeError(err);
       }
     },
     cancel() {
+      closed = true;
       reader.cancel().catch(() => {});
     },
   });

@@ -57,6 +57,8 @@ type BlockState = TextState | ToolState;
 
 const BUFFERED_TOOL_PROGRESS_LOG_INTERVAL_MS = 30_000;
 const BUFFERED_TOOL_LARGE_ARGS_BYTES = 1_000_000;
+const BUFFERED_TOOL_MAX_ARGS_BYTES = 5_000_000;
+const BUFFERED_TOOL_MAX_DURATION_MS = 120_000;
 
 function shouldBufferToolArgs(name: string): boolean {
   return name === "Read";
@@ -101,6 +103,39 @@ function logBufferedToolProgress(log: Logger, state: ToolState, force = false): 
     elapsedMs: now - state.startedAt,
     args: toolArgSummary(state.argsAccum),
   });
+}
+
+function throwIfBufferedToolExceeded(state: ToolState): void {
+  if (!state.bufferUntilDone) return;
+  const elapsedMs = Date.now() - state.startedAt;
+  if (state.argsAccum.length <= BUFFERED_TOOL_MAX_ARGS_BYTES && elapsedMs <= BUFFERED_TOOL_MAX_DURATION_MS) return;
+  throw new UpstreamStreamError(
+    "failed",
+    `Buffered ${state.name} tool arguments exceeded safe limits`,
+  );
+}
+
+function describeOpenBlock(outputIndex: number, state: BlockState): Record<string, unknown> {
+  if (state.kind === "text") {
+    return {
+      outputIndex,
+      index: state.index,
+      kind: state.kind,
+      textLength: state.textAccum.length,
+    };
+  }
+  return {
+    outputIndex,
+    index: state.index,
+    kind: state.kind,
+    callId: state.callId,
+    name: state.name,
+    deltaCount: state.deltaCount,
+    elapsedMs: Date.now() - state.startedAt,
+    bufferUntilDone: state.bufferUntilDone,
+    emittedArgs: state.emittedArgs,
+    args: toolArgSummary(state.argsAccum),
+  };
 }
 
 /**
@@ -243,6 +278,7 @@ export async function* reduceUpstream(
       state.deltaCount += 1;
       state.hadDelta = true;
       logBufferedToolProgress(log, state);
+      throwIfBufferedToolExceeded(state);
       if (!state.bufferUntilDone) {
         state.emittedArgs = true;
         yield { kind: "tool-delta", index: state.index, partialJson: delta };
@@ -316,7 +352,7 @@ export async function* reduceUpstream(
           index: state.index,
           callId: state.callId,
           name: state.name,
-          args: state.argsAccum,
+          args: toolArgSummary(state.argsAccum),
         });
         yield { kind: "tool-stop", index: state.index };
       }
@@ -337,6 +373,24 @@ export async function* reduceUpstream(
       }
       continue;
     }
+  }
+
+  const openBlocks = Array.from(blocksByOutputIndex, ([outputIndex, state]) =>
+    describeOpenBlock(outputIndex, state),
+  );
+  if (!diagnostics.sawTerminalEvent || openBlocks.length) {
+    log.warn("upstream stream ended without complete response", {
+      sawTerminalEvent: diagnostics.sawTerminalEvent,
+      lastEventType: diagnostics.lastEventType,
+      openBlocks,
+      stats: diagnostics.stats,
+    });
+    throw new UpstreamStreamError(
+      "failed",
+      diagnostics.sawTerminalEvent
+        ? "Upstream stream ended with open output blocks"
+        : "Upstream stream ended without a terminal response event",
+    );
   }
 
   const stopReason: StopReason = incomplete ? "max_tokens" : sawToolUse ? "tool_use" : "end_turn";
