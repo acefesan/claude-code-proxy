@@ -161,10 +161,11 @@ async function doFetch(
 ): Promise<Response> {
   const mode = codexTransport();
   const continuationEnabled = codexPreviousResponseId();
-  const usePooledWebSocket = continuationEnabled && !!opts.continuation?.previousResponseId;
+  const poolKey = continuationEnabled ? ctx.sessionId : undefined;
+  if (shouldResetWebSocketPool(opts.continuation)) invalidateCodexWebSocketPoolKey(poolKey);
   const websocketOpts = {
     ...opts,
-    poolKey: usePooledWebSocket ? ctx.sessionId : undefined,
+    poolKey,
   };
   if (mode === "websocket") {
     return doFetchWebSocket(accessToken, accountId, body, ctx, log, websocketOpts);
@@ -385,6 +386,11 @@ function isSafeFullWebSocketRetry(
 ): boolean {
   if (!continuation?.previousResponseId) return false;
   return isPreviousResponseMissingError(err);
+}
+
+function shouldResetWebSocketPool(continuation: ContinuationCandidate | undefined): boolean {
+  if (!continuation?.disabledReason) return false;
+  return continuation.disabledReason !== "missing_state" && continuation.disabledReason !== "disabled";
 }
 
 export class CodexHeaderTimeoutError extends Error {
