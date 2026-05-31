@@ -161,9 +161,10 @@ async function doFetch(
 ): Promise<Response> {
   const mode = codexTransport();
   const continuationEnabled = codexPreviousResponseId();
+  const usePooledWebSocket = continuationEnabled && !!opts.continuation?.previousResponseId;
   const websocketOpts = {
     ...opts,
-    poolKey: continuationEnabled ? ctx.sessionId : undefined,
+    poolKey: usePooledWebSocket ? ctx.sessionId : undefined,
   };
   if (mode === "websocket") {
     return doFetchWebSocket(accessToken, accountId, body, ctx, log, websocketOpts);

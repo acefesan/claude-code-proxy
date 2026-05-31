@@ -470,7 +470,14 @@ export function isPreviousResponseMissingError(err: unknown): boolean {
 
 function shouldExposeStream(event: { type?: string }): boolean {
   const type = event.type;
-  return !!type && type !== "codex.rate_limits" && type !== "response.created" && type !== "response.in_progress";
+  return (
+    type === "response.output_text.delta" ||
+    type === "response.function_call_arguments.delta" ||
+    type === "response.completed" ||
+    type === "response.incomplete" ||
+    type === "response.done" ||
+    type === "error"
+  );
 }
 
 function isSetupErrorEvent(event: {
