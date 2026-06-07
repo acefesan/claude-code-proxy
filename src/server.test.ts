@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { loadConfig } from "./config.ts";
 import { startServer, normalizeIncomingModel } from "./server.ts";
+import { startTestServer } from "./test/server.ts";
 
 const servers: Array<{ stop: () => void }> = [];
 
@@ -31,7 +32,7 @@ describe("normalizeIncomingModel", () => {
 describe("server session-aware alias routing", () => {
   it("routes aliases to the concrete provider used earlier in the session", async () => {
     loadConfig({ env: { CCP_CODEX_SERVICE_TIER: "standard" }, forceReload: true });
-    const server = startServer({ port: 0 });
+    const server = startTestServer(startServer);
     servers.push(server);
 
     const sessionId = crypto.randomUUID();
