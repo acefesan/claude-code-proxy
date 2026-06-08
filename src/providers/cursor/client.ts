@@ -1,7 +1,7 @@
 import { gunzipSync } from "node:zlib";
 import http2 from "node:http2";
-import { readFile, stat } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import { cursorBaseUrl, cursorClientVersion } from "../../config.ts";
 import type { RequestContext, TrafficCapture } from "../types.ts";
 import type { Logger } from "../../log.ts";
@@ -388,6 +388,9 @@ async function processServerControlFrames(
       } else if (oneof.value?.message?.case === "readArgs") {
         await append({ execClientMessage: await buildReadResult(oneof.value) });
         await append({ execClientControlMessage: { streamClose: { id: oneof.value.id } } });
+      } else if (oneof.value?.message?.case === "writeArgs") {
+        await append({ execClientMessage: await buildWriteResult(oneof.value) });
+        await append({ execClientControlMessage: { streamClose: { id: oneof.value.id } } });
       } else if (oneof.value?.message?.case === "grepArgs") {
         await append({ execClientMessage: await buildGrepResult(oneof.value) });
         await append({ execClientControlMessage: { streamClose: { id: oneof.value.id } } });
@@ -459,6 +462,59 @@ async function buildReadResult(exec: {
       },
     },
   };
+}
+
+async function buildWriteResult(exec: {
+  id?: number;
+  execId?: string;
+  message?: { case?: string; value?: unknown };
+}): Promise<Record<string, unknown>> {
+  const args = asRecord(exec.message?.value);
+  const requestedPath = typeof args?.path === "string" ? args.path : "";
+  const returnContent = Boolean(args?.returnFileContentAfterWrite);
+  try {
+    if (!requestedPath) throw new Error("write path is required");
+    const content = writeContentFromArgs(args);
+    await mkdir(dirname(requestedPath), { recursive: true });
+    await writeFile(requestedPath, content);
+    const textContent = typeof content === "string" ? content : content.toString("utf8");
+    const success: Record<string, unknown> = {
+      path: requestedPath,
+      linesCreated: lineCount(textContent),
+      fileSize: Buffer.byteLength(content),
+    };
+    if (returnContent) success.fileContentAfterWrite = await readFile(requestedPath, "utf8");
+    return {
+      ...(typeof exec.id === "number" ? { id: exec.id } : {}),
+      ...(typeof exec.execId === "string" ? { execId: exec.execId } : {}),
+      writeResult: { success },
+    };
+  } catch (err) {
+    return {
+      ...(typeof exec.id === "number" ? { id: exec.id } : {}),
+      ...(typeof exec.execId === "string" ? { execId: exec.execId } : {}),
+      writeResult: {
+        error: {
+          path: requestedPath,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      },
+    };
+  }
+}
+
+function writeContentFromArgs(args: Record<string, unknown> | undefined): string | Buffer {
+  if (typeof args?.fileText === "string") return args.fileText;
+  if (typeof args?.file_text === "string") return args.file_text;
+  if (typeof args?.fileBytes === "string") return Buffer.from(args.fileBytes, "base64");
+  if (typeof args?.file_bytes === "string") return Buffer.from(args.file_bytes, "base64");
+  if (args?.fileBytes instanceof Uint8Array) return Buffer.from(args.fileBytes);
+  if (args?.file_bytes instanceof Uint8Array) return Buffer.from(args.file_bytes);
+  return "";
+}
+
+function lineCount(content: string): number {
+  return content.length === 0 ? 0 : content.split("\n").length;
 }
 
 async function runShellStream(

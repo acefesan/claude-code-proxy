@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeCursorStream, encodeConnectFrame, runCursorAgent } from "./client.ts";
@@ -115,6 +115,69 @@ describe("Cursor protocol client", () => {
       },
     });
     expect(clientMessages[3]).toEqual({ execClientControlMessage: { streamClose: { id: 7 } } });
+  });
+
+  it("answers Cursor writeArgs by writing the file and closing the exec stream", async () => {
+    const sentFrames: Uint8Array[] = [];
+    const dir = await mkdtemp(join(tmpdir(), "cursor-write-"));
+    const file = join(dir, "history", "findings.md");
+
+    const upstream = await runCursorAgent({
+      prompt: "hello",
+      mode: "AGENT_MODE_AGENT",
+      conversationId: "conversation",
+      model: { modelId: "composer-2.5" },
+      auth: { accessToken: "token", source: "test" },
+      ctx: fakeCtx(),
+      proto: fakeProto,
+      openRunStream: async () => ({
+        readable: streamFromChunks([
+          frame({
+            message: {
+              case: "execServerMessage",
+              value: {
+                id: 10,
+                execId: "exec-write",
+                message: {
+                  case: "writeArgs",
+                  value: {
+                    path: file,
+                    fileText: "finding one\nfinding two\n",
+                    returnFileContentAfterWrite: true,
+                  },
+                },
+              },
+            },
+          }),
+          encodeConnectFrame(jsonBytes({}), 2),
+        ]),
+        status: Promise.resolve({ status: 200 }),
+        async write(frame) {
+          sentFrames.push(frame);
+        },
+        close() {},
+      }),
+    });
+    await drain(upstream);
+
+    const clientMessages = sentFrames.map(decodeFrameJson) as Array<Record<string, any>>;
+    expect(await readFile(file, "utf8")).toBe("finding one\nfinding two\n");
+    expect(clientMessages[1]).toEqual({ execClientControlMessage: { heartbeat: {} } });
+    expect(clientMessages[2]).toEqual({
+      execClientMessage: {
+        id: 10,
+        execId: "exec-write",
+        writeResult: {
+          success: {
+            path: file,
+            linesCreated: 3,
+            fileSize: 24,
+            fileContentAfterWrite: "finding one\nfinding two\n",
+          },
+        },
+      },
+    });
+    expect(clientMessages[3]).toEqual({ execClientControlMessage: { streamClose: { id: 10 } } });
   });
 
   it("answers Cursor grepArgs with glob file matches and closes the exec stream", async () => {
