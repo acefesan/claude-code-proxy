@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.0.17 (2026-06-08)
+
+- Added Cursor Agent as a provider, including login, model selection, ask mode, plan mode, and session continuation.
+- Cursor users can select models from the Cursor catalog with `cursor:<model-id>`, `cursor-plan:<model-id>`, and `cursor-ask:<model-id>` aliases.
+- Claude Code `/effort` now maps to matching Cursor model variants when Cursor offers them.
+- Cursor conversations can now use Claude Code's Bash, Read, and Write tools through the proxy, while unadvertised tool requests are denied safely.
+- Cursor requests now support web search results and image inputs.
+- Startup and `models` output now show Cursor's large model catalog in a compact form, with `models --full` available for the complete list.
+
 ## v0.0.16 (2026-06-02)
 
 - Codex now uses WebSocket transport by default
