@@ -54,11 +54,110 @@ describe("Cursor protocol client", () => {
 
     const clientMessages = sentFrames.map(decodeFrameJson) as Array<Record<string, any>>;
     expect(clientMessages[0]?.runRequest.conversationId).toBe("conversation");
+    expect(clientMessages[0]?.runRequest.clientSupportsInlineImages).toBe(true);
     expect(clientMessages[1]).toEqual({ execClientControlMessage: { heartbeat: {} } });
     expect(clientMessages[2]?.execClientMessage.requestContextResult.success.requestContext).toBeDefined();
+    expect(clientMessages[2]?.execClientMessage.requestContextResult.success.requestContext.webSearchEnabled).toBe(true);
+    expect(clientMessages[2]?.execClientMessage.requestContextResult.success.requestContext.webFetchEnabled).toBe(true);
     expect(clientMessages[3]).toEqual({ execClientControlMessage: { streamClose: {} } });
     expect(clientMessages[4]).toEqual({ kvClientMessage: { setBlobResult: {} } });
     expect(clientMessages[5]).toEqual({ kvClientMessage: { getBlobResult: {}, id: 2 } });
+  });
+
+  it("sends selected images in the Cursor run request", async () => {
+    const sentFrames: Uint8Array[] = [];
+
+    const upstream = await runCursorAgent({
+      prompt: "describe image",
+      mode: "AGENT_MODE_AGENT",
+      conversationId: "conversation",
+      model: { modelId: "composer-2.5" },
+      selectedImages: [
+        {
+          data: "aGVsbG8=",
+          uuid: "image-id",
+          path: "claude-image-1.png",
+          mimeType: "image/png",
+        },
+      ],
+      auth: { accessToken: "token", source: "test" },
+      ctx: fakeCtx(),
+      proto: fakeProto,
+      openRunStream: async () => ({
+        readable: streamFromChunks([encodeConnectFrame(jsonBytes({}), 2)]),
+        status: Promise.resolve({ status: 200 }),
+        async write(frame) {
+          sentFrames.push(frame);
+        },
+        close() {},
+      }),
+    });
+    await drain(upstream);
+
+    const clientMessages = sentFrames.map(decodeFrameJson) as Array<Record<string, any>>;
+    expect(clientMessages[0]?.runRequest.action.userMessageAction.userMessage.selectedContext).toEqual({
+      selectedImages: [
+        {
+          data: "aGVsbG8=",
+          uuid: "image-id",
+          path: "claude-image-1.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+    expect(clientMessages[0]?.runRequest.clientSupportsInlineImages).toBe(true);
+  });
+
+  it("approves Cursor web search and web fetch interaction queries", async () => {
+    const sentFrames: Uint8Array[] = [];
+
+    const upstream = await runCursorAgent({
+      prompt: "search the web",
+      mode: "AGENT_MODE_AGENT",
+      conversationId: "conversation",
+      model: { modelId: "composer-2.5" },
+      auth: { accessToken: "token", source: "test" },
+      ctx: fakeCtx(),
+      proto: fakeProto,
+      openRunStream: async () => ({
+        readable: streamFromChunks([
+          frame({
+            message: {
+              case: "interactionQuery",
+              value: { id: 11, query: { case: "webSearchRequestQuery", value: { args: { searchTerm: "cursor" } } } },
+            },
+          }),
+          frame({
+            message: {
+              case: "interactionQuery",
+              value: { id: 12, query: { case: "webFetchRequestQuery", value: { args: { url: "https://example.com" } } } },
+            },
+          }),
+          frame({
+            message: {
+              case: "interactionQuery",
+              value: { id: 13, query: { case: "generateImageRequestQuery", value: {} } },
+            },
+          }),
+          encodeConnectFrame(jsonBytes({}), 2),
+        ]),
+        status: Promise.resolve({ status: 200 }),
+        async write(frame) {
+          sentFrames.push(frame);
+        },
+        close() {},
+      }),
+    });
+    await drain(upstream);
+
+    const clientMessages = sentFrames.map(decodeFrameJson) as Array<Record<string, any>>;
+    expect(clientMessages).toContainEqual({
+      interactionResponse: { id: 11, webSearchRequestResponse: { approved: {} } },
+    });
+    expect(clientMessages).toContainEqual({
+      interactionResponse: { id: 12, webFetchRequestResponse: { approved: {} } },
+    });
+    expect(clientMessages.some((message) => message.interactionResponse?.id === 13)).toBe(false);
   });
 
   it("answers Cursor readArgs with file content and closes the exec stream", async () => {

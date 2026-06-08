@@ -8,12 +8,14 @@ import type { Logger } from "../../log.ts";
 import type { CursorProto } from "./proto-loader.ts";
 import { loadCursorProto } from "./proto-loader.ts";
 import type { CursorAuth } from "./auth/token-store.ts";
+import type { CursorSelectedImage } from "./translate/request.ts";
 
 export interface CursorRunOptions {
   prompt: string;
   mode: CursorAgentMode;
   conversationId: string;
   model: CursorModelRequest;
+  selectedImages?: CursorSelectedImage[];
   auth: CursorAuth;
   ctx: RequestContext;
   proto?: CursorProto;
@@ -165,7 +167,7 @@ export async function runCursorAgent(opts: CursorRunOptions): Promise<ReadableSt
           userMessage: {
             text: opts.prompt,
             messageId: crypto.randomUUID(),
-            selectedContext: {},
+            selectedContext: selectedContext(opts.selectedImages),
             mode: opts.mode,
           },
         },
@@ -176,6 +178,7 @@ export async function runCursorAgent(opts: CursorRunOptions): Promise<ReadableSt
       excludeWorkspaceContext: false,
       selectedSubagentModels: selectedSubagentModels(opts.model),
       conversationGroupId: opts.conversationId,
+      clientSupportsInlineImages: true,
     },
   });
 
@@ -465,6 +468,9 @@ async function processServerControlFrames(
         if (typeof kv.id === "number" && kv.id !== 0) msg.id = kv.id;
         await append({ kvClientMessage: msg });
       }
+    } else if (oneof?.case === "interactionQuery") {
+      const response = buildInteractionResponse(oneof.value);
+      if (response) await append({ interactionResponse: response });
     }
   }
 }
@@ -891,6 +897,8 @@ function buildRequestContextResult(exec: {
             projectFolder: process.cwd(),
             processWorkingDirectory: process.cwd(),
           },
+          webSearchEnabled: true,
+          webFetchEnabled: true,
           repositoryInfoComplete: true,
           rulesInfoComplete: true,
           envInfoComplete: true,
@@ -905,6 +913,21 @@ function buildRequestContextResult(exec: {
   };
 }
 
+function buildInteractionResponse(query: {
+  id?: number;
+  query?: { case?: string; value?: unknown };
+} | undefined): Record<string, unknown> | undefined {
+  if (!query || typeof query.id !== "number") return undefined;
+  switch (query.query?.case) {
+    case "webSearchRequestQuery":
+      return { id: query.id, webSearchRequestResponse: { approved: {} } };
+    case "webFetchRequestQuery":
+      return { id: query.id, webFetchRequestResponse: { approved: {} } };
+    default:
+      return undefined;
+  }
+}
+
 const controlFrameState = new WeakMap<
   (messageJson: unknown) => Promise<void>,
   { buffer: Buffer; execHeartbeatSent: boolean; requestContextAcked: boolean }
@@ -917,6 +940,7 @@ interface CursorOneofMessage {
       id?: number;
       execId?: string;
       message?: { case?: string; value?: unknown };
+      query?: { case?: string; value?: unknown };
     };
   };
 }
@@ -927,6 +951,7 @@ function summarizeCursorOneofMessage(message: CursorOneofMessage): Record<string
   return {
     case: oneof?.case ?? "unknown",
     innerCase: value?.message?.case,
+    queryCase: value?.query?.case,
     id: value?.id,
     execId: value?.execId,
   };
@@ -1110,6 +1135,18 @@ export function encodeConnectFrame(payload: Uint8Array, flags = 0): Uint8Array {
   view.setUint32(1, payload.byteLength, false);
   out.set(payload, 5);
   return out;
+}
+
+function selectedContext(images: CursorSelectedImage[] | undefined): Record<string, unknown> {
+  if (!images?.length) return {};
+  return {
+    selectedImages: images.map((image) => ({
+      data: image.data,
+      uuid: image.uuid,
+      path: image.path,
+      mimeType: image.mimeType,
+    })),
+  };
 }
 
 function selectedSubagentModels(model: CursorModelRequest): CursorModelRequest[] {

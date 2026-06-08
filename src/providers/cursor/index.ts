@@ -15,7 +15,7 @@ import {
   loadCursorAuth,
   missingAuthMessage,
 } from "./auth/token-store.ts";
-import { renderCursorPrompt } from "./translate/request.ts";
+import { cursorSelectedImages, renderCursorPrompt } from "./translate/request.ts";
 import { CURSOR_SUPPORTED_MODELS, resolveCursorModel } from "./translate/model.ts";
 import {
   accumulateCursorResponse,
@@ -71,6 +71,7 @@ async function handleMessages(
 
   const selection = resolveCursorModel(body);
   const prompt = renderCursorPrompt(body);
+  const selectedImages = cursorSelectedImages(body);
   const wantStream = wantsDownstreamStream(body);
   const conversationId = cursorConversationForRequest(body, ctx.sessionId);
 
@@ -82,6 +83,7 @@ async function handleMessages(
     stream: wantStream,
     messageCount: body.messages.length,
     promptChars: prompt.length,
+    selectedImageCount: selectedImages.length,
   });
   if (logVerbose()) log.debug("cursor prompt", { prompt });
 
@@ -118,6 +120,7 @@ async function handleMessages(
       mode: selection.mode,
       conversationId,
       model: selection.requestedModel,
+      selectedImages,
       auth,
       ctx,
       readHandler: bridgeRead

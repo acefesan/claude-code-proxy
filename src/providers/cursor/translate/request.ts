@@ -1,10 +1,18 @@
 import type {
   AnthropicContentBlock,
+  AnthropicImageBlock,
   AnthropicMessage,
   AnthropicRequest,
   AnthropicTextBlock,
   AnthropicToolResultContentBlock,
 } from "../../../anthropic/schema.ts";
+
+export interface CursorSelectedImage {
+  data: string;
+  uuid: string;
+  path: string;
+  mimeType: string;
+}
 
 export function renderCursorPrompt(req: AnthropicRequest): string {
   const sections: string[] = [];
@@ -33,6 +41,27 @@ export function renderCursorPrompt(req: AnthropicRequest): string {
   return sections.join("\n\n");
 }
 
+export function cursorSelectedImages(req: AnthropicRequest): CursorSelectedImage[] {
+  const images: CursorSelectedImage[] = [];
+  let index = 0;
+  for (const message of req.messages) {
+    for (const block of messageBlocks(message)) {
+      collectImageBlocks(block, (image) => {
+        if (image.source.type !== "base64") return;
+        const uuid = crypto.randomUUID();
+        const extension = imageExtension(image.source.media_type);
+        images.push({
+          data: image.source.data,
+          uuid,
+          path: `claude-image-${++index}.${extension}`,
+          mimeType: image.source.media_type,
+        });
+      });
+    }
+  }
+  return images;
+}
+
 function renderSystem(system: AnthropicRequest["system"]): string | undefined {
   if (!system) return undefined;
   const blocks: AnthropicTextBlock[] =
@@ -46,9 +75,7 @@ function renderSystem(system: AnthropicRequest["system"]): string | undefined {
 }
 
 function renderContent(message: AnthropicMessage): string {
-  const blocks: AnthropicContentBlock[] =
-    typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
-  return blocks.map(renderBlock).filter(Boolean).join("\n\n");
+  return messageBlocks(message).map(renderBlock).filter(Boolean).join("\n\n");
 }
 
 function renderBlock(block: AnthropicContentBlock): string {
@@ -78,4 +105,36 @@ function renderToolResultBlock(block: AnthropicToolResultContentBlock): string {
   }
   const type = typeof block.type === "string" ? block.type : "unknown";
   return `[unsupported tool result block: ${type}]`;
+}
+
+function messageBlocks(message: AnthropicMessage): AnthropicContentBlock[] {
+  return typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
+}
+
+function collectImageBlocks(block: AnthropicContentBlock, visit: (block: AnthropicImageBlock) => void): void {
+  if (block.type === "image") {
+    visit(block);
+    return;
+  }
+  if (block.type !== "tool_result" || typeof block.content === "string") return;
+  for (const child of block.content) {
+    if (child.type === "text" || child.type === "image" || child.type === "tool_use" || child.type === "tool_result" || child.type === "thinking") {
+      collectImageBlocks(child as AnthropicContentBlock, visit);
+    }
+  }
+}
+
+function imageExtension(mediaType: string): string {
+  switch (mediaType) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/png":
+      return "png";
+    case "image/gif":
+      return "gif";
+    case "image/webp":
+      return "webp";
+    default:
+      return "img";
+  }
 }
