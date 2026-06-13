@@ -307,29 +307,28 @@ class CodexWebSocketConnection {
     else active.pendingChunks.push(chunk);
   }
 
-  private finishActive(): void {
-    const active = this.active;
+  private tearDownActive(active: ActiveRequest | undefined): ActiveRequest | undefined {
     if (!active || active.done) return;
     active.done = true;
     this.clearIdle(active);
     if (this.activeAbort) active.ctx.signal.removeEventListener("abort", this.activeAbort);
     this.activeAbort = undefined;
     this.active = undefined;
-    if (!this.keepAlive) this.socket?.close();
     active.releaseQueue();
+    return active;
+  }
+
+  private finishActive(): void {
+    const active = this.tearDownActive(this.active);
+    if (!active) return;
+    if (!this.keepAlive) this.socket?.close();
     if (active.controller) active.controller.close();
     else active.pendingChunks.push(new Uint8Array());
   }
 
   private failActive(err: Error): void {
-    const active = this.active;
-    if (!active || active.done) return;
-    active.done = true;
-    this.clearIdle(active);
-    if (this.activeAbort) active.ctx.signal.removeEventListener("abort", this.activeAbort);
-    this.activeAbort = undefined;
-    this.active = undefined;
-    active.releaseQueue();
+    const active = this.tearDownActive(this.active);
+    if (!active) return;
     if (err instanceof CodexWebSocketSetupError) err.requestSent = active.requestSent;
     else if (active.requestSent) err = new CodexWebSocketSetupError(err.message, undefined, undefined, undefined, true);
     if (active.requestSent) {
