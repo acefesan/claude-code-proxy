@@ -1,4 +1,5 @@
 import type { CursorUsage } from "./client.ts";
+import { emitMessageStart } from "../shared/anthropic-sse.ts";
 
 type CursorSseStopReason = "end_turn" | "tool_use";
 
@@ -39,25 +40,7 @@ export function createCursorSseFramer(opts: CursorSseFramingOptions): CursorSseF
   const ensureStart = () => {
     if (started) return;
     started = true;
-    emit("message_start", {
-      type: "message_start",
-      message: {
-        id: opts.messageId,
-        type: "message",
-        role: "assistant",
-        model: opts.model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
-        },
-      },
-    });
-    emit("ping", { type: "ping" });
+    emitMessageStart(emit, { messageId: opts.messageId, model: opts.model });
   };
 
   const openThinking = () => {
