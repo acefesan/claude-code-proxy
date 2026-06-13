@@ -1,6 +1,7 @@
 import { mapUsageToAnthropic, reduceUpstream, type KimiUsage } from "./reducer.ts";
 import { makeThinkingSignature } from "./signature.ts";
 import type { TrafficCapture } from "../../types.ts";
+import { createBlockAccumulator, parseToolInputJsonOrRaw } from "../../translate/accumulate.ts";
 
 export { UpstreamStreamError } from "./reducer.ts";
 
@@ -35,13 +36,7 @@ export async function accumulateResponse(
   upstream: ReadableStream<Uint8Array>,
   opts: { messageId: string; model: string; log: Logger; traffic?: TrafficCapture },
 ): Promise<AccumulatedResponse> {
-  type Block =
-    | { kind: "thinking"; text: string }
-    | { kind: "text"; text: string }
-    | { kind: "tool"; id: string; name: string; args: string };
-
-  const ordered: number[] = [];
-  const blocks = new Map<number, Block>();
+  const blockAccumulator = createBlockAccumulator({ includeThinking: true });
   let stopReason: AnthropicNonStreamResponse["stop_reason"] = null;
   let usage: ReturnType<typeof mapUsageToAnthropic> | undefined;
   let rawUsage: KimiUsage | undefined;
@@ -53,37 +48,29 @@ export async function accumulateResponse(
   for await (const e of reduceUpstream(upstream, stats, opts.log)) {
     switch (e.kind) {
       case "thinking-start":
-        blocks.set(e.index, { kind: "thinking", text: "" });
-        ordered.push(e.index);
+        blockAccumulator.onThinkingStart(e.index);
         break;
       case "thinking-delta": {
-        const b = blocks.get(e.index);
-        if (b?.kind === "thinking") {
-          b.text += e.text;
+        if (blockAccumulator.onThinkingDelta(e.index, e.text)) {
           reasoningChars += e.text.length;
         }
         break;
       }
       case "text-start":
-        blocks.set(e.index, { kind: "text", text: "" });
-        ordered.push(e.index);
+        blockAccumulator.onTextStart(e.index);
         break;
       case "text-delta": {
-        const b = blocks.get(e.index);
-        if (b?.kind === "text") {
-          b.text += e.text;
+        if (blockAccumulator.onTextDelta(e.index, e.text)) {
           contentChars += e.text.length;
         }
         break;
       }
       case "tool-start":
         toolCount++;
-        blocks.set(e.index, { kind: "tool", id: e.id, name: e.name, args: "" });
-        ordered.push(e.index);
+        blockAccumulator.onToolStart(e.index, e.id, e.name);
         break;
       case "tool-delta": {
-        const b = blocks.get(e.index);
-        if (b?.kind === "tool") b.args += e.partialJson;
+        blockAccumulator.onToolDelta(e.index, e.partialJson);
         break;
       }
       case "thinking-stop":
@@ -99,26 +86,23 @@ export async function accumulateResponse(
   }
 
   const content: AnthropicNonStreamResponse["content"] = [];
-  for (const i of ordered) {
-    const b = blocks.get(i);
-    if (!b) continue;
+  for (const b of blockAccumulator.orderedBlocks()) {
     if (b.kind === "thinking") {
       if (b.text)
         content.push({
           type: "thinking",
           thinking: b.text,
-          signature: makeThinkingSignature(opts.messageId, i),
+          signature: makeThinkingSignature(opts.messageId, b.index),
         });
     } else if (b.kind === "text") {
       if (b.text) content.push({ type: "text", text: b.text });
     } else {
-      let input: unknown = {};
-      try {
-        input = b.args ? JSON.parse(b.args) : {};
-      } catch {
-        input = { _raw: b.args };
-      }
-      content.push({ type: "tool_use", id: b.id, name: b.name, input });
+      content.push({
+        type: "tool_use",
+        id: b.id,
+        name: b.name,
+        input: parseToolInputJsonOrRaw(b.args),
+      });
     }
   }
 

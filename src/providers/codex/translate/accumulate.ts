@@ -3,6 +3,7 @@ import type { CodexUsage, ReducerEvent } from "./reducer.ts";
 import type { Logger } from "../../../log.ts";
 import type { TrafficCapture } from "../../types.ts";
 import { attachTrafficCapture, createUpstreamStreamDiagnostics } from "./reducer.ts";
+import { createBlockAccumulator, parseToolInputJsonOrRaw } from "../../translate/accumulate.ts";
 
 export { UpstreamStreamError } from "./reducer.ts";
 
@@ -45,12 +46,7 @@ export async function accumulateResponse(
   upstream: ReadableStream<Uint8Array>,
   opts: { messageId: string; model: string; log: Logger; traffic?: TrafficCapture },
 ): Promise<AccumulatedResponse> {
-  type Block =
-    | { kind: "text"; text: string }
-    | { kind: "tool"; id: string; name: string; args: string };
-
-  const ordered: number[] = [];
-  const blocks = new Map<number, Block>();
+  const blockAccumulator = createBlockAccumulator();
   let stopReason: AnthropicNonStreamResponse["stop_reason"] = null;
   let usage: ReturnType<typeof mapUsageToAnthropic> | undefined;
   let rawUsage: CodexUsage | undefined;
@@ -64,21 +60,17 @@ export async function accumulateResponse(
   for await (const e of reduceUpstream(upstream, opts.log, diagnostics)) {
     switch (e.kind) {
       case "text-start":
-        blocks.set(e.index, { kind: "text", text: "" });
-        ordered.push(e.index);
+        blockAccumulator.onTextStart(e.index);
         break;
       case "text-delta": {
-        const b = blocks.get(e.index);
-        if (b?.kind === "text") b.text += e.text;
+        blockAccumulator.onTextDelta(e.index, e.text);
         break;
       }
       case "tool-start":
-        blocks.set(e.index, { kind: "tool", id: e.id, name: e.name, args: "" });
-        ordered.push(e.index);
+        blockAccumulator.onToolStart(e.index, e.id, e.name);
         break;
       case "tool-delta": {
-        const b = blocks.get(e.index);
-        if (b?.kind === "tool") b.args += e.partialJson;
+        blockAccumulator.onToolDelta(e.index, e.partialJson);
         break;
       }
       case "text-stop":
@@ -97,19 +89,16 @@ export async function accumulateResponse(
   }
 
   const content: AnthropicNonStreamResponse["content"] = [];
-  for (const i of ordered) {
-    const b = blocks.get(i);
-    if (!b) continue;
+  for (const b of blockAccumulator.orderedBlocks()) {
     if (b.kind === "text") {
       if (b.text) content.push({ type: "text", text: b.text });
-    } else {
-      let input: unknown = {};
-      try {
-        input = b.args ? JSON.parse(b.args) : {};
-      } catch {
-        input = { _raw: b.args };
-      }
-      content.push({ type: "tool_use", id: b.id, name: b.name, input });
+    } else if (b.kind === "tool") {
+      content.push({
+        type: "tool_use",
+        id: b.id,
+        name: b.name,
+        input: parseToolInputJsonOrRaw(b.args),
+      });
     }
   }
 
