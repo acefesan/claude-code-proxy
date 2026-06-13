@@ -1,10 +1,12 @@
 import { encode } from "gpt-tokenizer/model/gpt-4o";
 import type { AnthropicRequest } from "../../anthropic/schema.ts";
 import type { KimiChatRequest } from "./translate/request.ts";
-import { countAnthropicRequestTokensWithSystem } from "../shared/count-tokens.ts";
+import {
+  countAnthropicRequestTokensWithSystem,
+  IMAGE_TOKEN_ESTIMATE,
+  countContentParts,
+} from "../shared/count-tokens.ts";
 import { countToolSchemaTokens } from "../shared/tool-schema.ts";
-
-const IMAGE_TOKEN_ESTIMATE = 2000;
 
 // Approximate: Kimi's tokenizer isn't gpt-tokenizer, but Claude Code's
 // compaction logic only needs a monotonic estimate, not an exact count.
@@ -26,13 +28,7 @@ export function countTranslatedTokens(req: KimiChatRequest): number {
     if (m.role === "system") {
       total += encode(m.content).length;
     } else if (m.role === "user") {
-      if (typeof m.content === "string") total += encode(m.content).length;
-      else {
-        for (const p of m.content) {
-          if (p.type === "text") total += encode(p.text).length;
-          else total += IMAGE_TOKEN_ESTIMATE;
-        }
-      }
+      total += countContentParts(m.content, (v) => encode(v).length);
     } else if (m.role === "assistant") {
       if (typeof m.content === "string") total += encode(m.content).length;
       if (m.reasoning_content) total += encode(m.reasoning_content).length;
@@ -41,13 +37,7 @@ export function countTranslatedTokens(req: KimiChatRequest): number {
         total += encode(tc.function.arguments).length;
       }
     } else if (m.role === "tool") {
-      if (typeof m.content === "string") total += encode(m.content).length;
-      else {
-        for (const p of m.content) {
-          if (p.type === "text") total += encode(p.text).length;
-          else total += IMAGE_TOKEN_ESTIMATE;
-        }
-      }
+      total += countContentParts(m.content, (v) => encode(v).length);
     }
   }
 

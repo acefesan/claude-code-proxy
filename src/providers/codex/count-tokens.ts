@@ -1,10 +1,11 @@
 import { encode } from "gpt-tokenizer/model/gpt-4o";
 import type { AnthropicRequest } from "../../anthropic/schema.ts";
 import type { ResponsesRequest } from "./translate/request.ts";
-import { countAnthropicRequestTokensWithSystem } from "../shared/count-tokens.ts";
+import {
+  countAnthropicRequestTokensWithSystem,
+  IMAGE_TOKEN_ESTIMATE,
+} from "../shared/count-tokens.ts";
 import { countToolSchemaTokens } from "../shared/tool-schema.ts";
-
-const IMAGE_TOKEN_ESTIMATE = 2000;
 
 export function countTokens(req: AnthropicRequest): number {
   return countAnthropicRequestTokensWithSystem({

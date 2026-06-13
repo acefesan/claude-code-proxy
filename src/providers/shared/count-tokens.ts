@@ -6,7 +6,20 @@ import {
 } from "../translate/anthropic-content.ts";
 import type { AnthropicRequest } from "../../anthropic/schema.ts";
 
-const IMAGE_TOKEN_ESTIMATE = 2000;
+export const IMAGE_TOKEN_ESTIMATE = 2000;
+
+export function countContentParts(
+  content: string | { type: string; text?: string }[],
+  countToken: (text: string) => number,
+): number {
+  if (typeof content === "string") return countToken(content);
+  let total = 0;
+  for (const p of content) {
+    if (p.type === "text") total += countToken(p.text ?? "");
+    else total += IMAGE_TOKEN_ESTIMATE;
+  }
+  return total;
+}
 
 export type AnthropicRequestTokenCounter = (text: string) => number;
 
