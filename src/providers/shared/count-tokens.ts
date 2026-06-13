@@ -1,5 +1,9 @@
 import { countToolSchemaTokens } from "./tool-schema.ts";
-import { normalizeContent, toolResultToString } from "../translate/anthropic-content.ts";
+import {
+  flattenSystemText,
+  normalizeContent,
+  toolResultToString,
+} from "../translate/anthropic-content.ts";
 import type { AnthropicRequest } from "../../anthropic/schema.ts";
 
 const IMAGE_TOKEN_ESTIMATE = 2000;
@@ -68,5 +72,29 @@ export function countAnthropicRequestTokens<TTool>(
   );
 
   total += req.messages.length * 4;
+  return total;
+}
+
+export function countAnthropicRequestTokensWithSystem<TTool>(
+  options: CountAnthropicRequestTokenOptions<TTool> & {
+    includeThinking?: false;
+  },
+): number;
+
+export function countAnthropicRequestTokensWithSystem<TTool>(
+  options: CountAnthropicRequestTokenOptions<TTool> & {
+    includeThinking: true;
+  },
+): number;
+
+export function countAnthropicRequestTokensWithSystem<TTool>(
+  options: CountAnthropicRequestTokenOptions<TTool> & { includeThinking?: boolean },
+): number {
+  let total = 0;
+  const system = flattenSystemText(options.req.system);
+  if (system) total += options.countToken(system);
+  total += options.includeThinking
+    ? countAnthropicRequestTokens({ ...options, includeThinking: true })
+    : countAnthropicRequestTokens({ ...options, includeThinking: false });
   return total;
 }

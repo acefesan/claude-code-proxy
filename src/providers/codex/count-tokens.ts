@@ -1,17 +1,13 @@
 import { encode } from "gpt-tokenizer/model/gpt-4o";
 import type { AnthropicRequest } from "../../anthropic/schema.ts";
 import type { ResponsesRequest } from "./translate/request.ts";
-import { flattenSystemText } from "../translate/anthropic-content.ts";
-import { countAnthropicRequestTokens } from "../shared/count-tokens.ts";
+import { countAnthropicRequestTokensWithSystem } from "../shared/count-tokens.ts";
 import { countToolSchemaTokens } from "../shared/tool-schema.ts";
 
 const IMAGE_TOKEN_ESTIMATE = 2000;
 
 export function countTokens(req: AnthropicRequest): number {
-  let total = 0;
-  const instructions = flattenSystemText(req.system);
-  if (instructions) total += encode(instructions).length;
-  total += countAnthropicRequestTokens({
+  return countAnthropicRequestTokensWithSystem({
     req,
     countToken: (value) => encode(value).length,
     tools: req.tools,
@@ -19,7 +15,6 @@ export function countTokens(req: AnthropicRequest): number {
     readToolDescription: (tool) => tool.description,
     readToolSchema: (tool) => tool.input_schema,
   });
-  return total;
 }
 
 export function countTranslatedTokens(
