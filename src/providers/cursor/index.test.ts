@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { cursorProvider, createCursorProvider } from "./index.ts";
-import { encodeConnectFrame, runCursorAgent } from "./client.ts";
+import { encodeConnectFrame, runCursorAgent, type CursorRunOptions } from "./client.ts";
 import {
   decodeFrameJson,
   collectCursorSse,
@@ -20,6 +20,91 @@ afterEach(() => {
   if (originalToken === undefined) delete process.env.CCP_CURSOR_AUTH_TOKEN;
   else process.env.CCP_CURSOR_AUTH_TOKEN = originalToken;
 });
+
+type CursorSseEvent = (Awaited<ReturnType<typeof collectCursorSse>>)[number];
+type CursorProviderOptions = NonNullable<Parameters<typeof createCursorProvider>[0]>;
+type CursorRunAgent = CursorProviderOptions["runAgent"];
+
+function createCursorTestProvider(runAgent: CursorRunAgent) {
+  return createCursorProvider({
+    loadAuth: async () => ({ accessToken: "token", source: "test" }),
+    runAgent,
+    proto: fakeProto,
+  });
+}
+
+function createRunStreamHarness(
+  initialServerMessage: Record<string, any>,
+  onWrite: (
+    message: Record<string, any>,
+    serverController: ReadableStreamDefaultController<Uint8Array>,
+  ) => Promise<void> | void,
+) {
+  const sentFrames: Array<Record<string, any>> = [];
+  let serverController!: ReadableStreamDefaultController<Uint8Array>;
+  const serverReadable = new ReadableStream<Uint8Array>({
+    start(controller) {
+      serverController = controller;
+      queueMicrotask(() => {
+        controller.enqueue(frame(initialServerMessage));
+      });
+    },
+  });
+  return {
+    sentFrames,
+    runAgent: async (opts: CursorRunOptions) =>
+      runCursorAgent({
+        ...opts,
+        proto: fakeProto,
+        openRunStream: async () => ({
+          readable: serverReadable,
+          status: Promise.resolve({ status: 200 }),
+          async write(frameBytes) {
+            const message = decodeFrameJson(frameBytes) as Record<string, any>;
+            sentFrames.push(message);
+            await onWrite(message, serverController);
+          },
+          close() {},
+        }),
+      }),
+  };
+}
+
+function findCursorSseEvent(
+  events: readonly CursorSseEvent[],
+  eventName: string,
+  predicate: (event: CursorSseEvent) => boolean = () => true,
+) {
+  return events.find((event) => event.event === eventName && predicate(event));
+}
+
+function getToolUseStartEvent(events: readonly CursorSseEvent[]) {
+  return findCursorSseEvent(
+    events,
+    "content_block_start",
+    (event) => event.data.content_block?.type === "tool_use",
+  );
+}
+
+function getInputJsonDeltaEvent(events: readonly CursorSseEvent[]) {
+  return findCursorSseEvent(
+    events,
+    "content_block_delta",
+    (event) => event.data.delta?.type === "input_json_delta",
+  );
+}
+
+function getTextDeltaEvent(events: readonly CursorSseEvent[]) {
+  return findCursorSseEvent(events, "content_block_delta");
+}
+
+function expectMessageStopReason(events: readonly CursorSseEvent[], reason: string) {
+  expect(findCursorSseEvent(events, "message_delta")?.data.delta.stop_reason).toBe(reason);
+}
+
+function expectMessageStop(events: readonly CursorSseEvent[]) {
+  expect(events.at(-1)?.event).toBe("message_stop");
+}
 
 describe("Cursor provider auth errors", () => {
   it("surfaces expired auth before calling Cursor", async () => {
@@ -45,15 +130,12 @@ describe("Cursor provider auth errors", () => {
 
 describe("Cursor provider messages", () => {
   it("returns assistant text for non-streaming requests", async () => {
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async () =>
-        streamFromChunks([
-          frame({ interactionUpdate: { textDelta: { text: "hello" } } }),
-          frame({ interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "1" } } }),
-          encodeConnectFrame(jsonBytes({}), 2),
-        ]),
-      proto: fakeProto,
+    const provider = createCursorTestProvider(async () => {
+      return streamFromChunks([
+        frame({ interactionUpdate: { textDelta: { text: "hello" } } }),
+        frame({ interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "1" } } }),
+        encodeConnectFrame(jsonBytes({}), 2),
+      ]);
     });
 
     const response = await provider.handleMessages(
@@ -71,15 +153,12 @@ describe("Cursor provider messages", () => {
   });
 
   it("returns valid Anthropic SSE for streaming requests", async () => {
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async () =>
-        streamFromChunks([
-          frame({ interactionUpdate: { textDelta: { text: "streamed" } } }),
-          frame({ interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "2" } } }),
-          encodeConnectFrame(jsonBytes({}), 2),
-        ]),
-      proto: fakeProto,
+    const provider = createCursorTestProvider(async () => {
+      return streamFromChunks([
+        frame({ interactionUpdate: { textDelta: { text: "streamed" } } }),
+        frame({ interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "2" } } }),
+        encodeConnectFrame(jsonBytes({}), 2),
+      ]);
     });
 
     const response = await provider.handleMessages(
@@ -96,39 +175,34 @@ describe("Cursor provider messages", () => {
     expect(response.headers.get("cache-control")).toBe("no-cache");
     expect(response.headers.get("connection")).toBe("keep-alive");
     expect(events.map((event) => event.event)).toContain("message_start");
-    expect(events.find((event) => event.event === "content_block_delta")?.data.delta.text).toBe(
-      "streamed",
-    );
-    expect(events.at(-1)?.event).toBe("message_stop");
+    expect(getTextDeltaEvent(events)?.data.delta.text).toBe("streamed");
+    expectMessageStop(events);
   });
 
   it("preserves Cursor Connect end error status for non-streaming requests", async () => {
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async () =>
-        streamFromChunks([
-          encodeConnectFrame(
-            jsonBytes({
-              error: {
-                code: "resource_exhausted",
-                message: "Error",
-                details: [
-                  {
-                    debug: {
-                      details: {
-                        additionalInfo: {
-                          chatMessage: "You've hit your free requests limit.",
-                        },
+    const provider = createCursorTestProvider(async () => {
+      return streamFromChunks([
+        encodeConnectFrame(
+          jsonBytes({
+            error: {
+              code: "resource_exhausted",
+              message: "Error",
+              details: [
+                {
+                  debug: {
+                    details: {
+                      additionalInfo: {
+                        chatMessage: "You've hit your free requests limit.",
                       },
                     },
                   },
-                ],
-              },
-            }),
-            2,
-          ),
-        ]),
-      proto: fakeProto,
+                },
+              ],
+            },
+          }),
+          2,
+        ),
+      ]);
     });
 
     const response = await provider.handleMessages(
@@ -146,62 +220,40 @@ describe("Cursor provider messages", () => {
   });
 
   it("bridges Cursor shellStreamArgs through Claude Bash tool_use and resumes from tool_result", async () => {
-    let serverController!: ReadableStreamDefaultController<Uint8Array>;
-    const sentFrames: Array<Record<string, any>> = [];
     let finalResponseSent = false;
     const workingDirectory = "/tmp/cursor bridge cwd";
-    const serverReadable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        serverController = controller;
-        queueMicrotask(() => {
-          controller.enqueue(frame({
+    const { sentFrames, runAgent } = createRunStreamHarness(
+      {
+        message: {
+          case: "execServerMessage",
+          value: {
+            id: 11,
+            execId: "exec-shell",
             message: {
-              case: "execServerMessage",
+              case: "shellStreamArgs",
               value: {
-                id: 11,
-                execId: "exec-shell",
-                message: {
-                  case: "shellStreamArgs",
-                  value: {
-                    command: "printf should-not-run",
-                    workingDirectory,
-                    timeout: 5000,
-                  },
-                },
+                command: "printf should-not-run",
+                workingDirectory,
+                timeout: 5000,
               },
             },
-          }));
-        });
+          },
+        },
       },
-    });
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async (opts) =>
-        runCursorAgent({
-          ...opts,
-          proto: fakeProto,
-          openRunStream: async () => ({
-            readable: serverReadable,
-            status: Promise.resolve({ status: 200 }),
-            async write(frameBytes) {
-              const message = decodeFrameJson(frameBytes) as Record<string, any>;
-              sentFrames.push(message);
-              if (message.execClientMessage?.shellStream?.exit && !finalResponseSent) {
-                finalResponseSent = true;
-                serverController.enqueue(frame({
-                  interactionUpdate: { textDelta: { text: "resumed after native shell" } },
-                }));
-                serverController.enqueue(frame({
-                  interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "3" } },
-                }));
-                serverController.close();
-              }
-            },
-            close() {},
-          }),
-        }),
-      proto: fakeProto,
-    });
+      (message, serverController) => {
+        if (message.execClientMessage?.shellStream?.exit && !finalResponseSent) {
+          finalResponseSent = true;
+          serverController.enqueue(frame({
+            interactionUpdate: { textDelta: { text: "resumed after native shell" } },
+          }));
+          serverController.enqueue(frame({
+            interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "3" } },
+          }));
+          serverController.close();
+        }
+      },
+    );
+    const provider = createCursorTestProvider(runAgent);
 
     const initial = await provider.handleMessages(
       {
@@ -213,17 +265,15 @@ describe("Cursor provider messages", () => {
       fakeCursorCtx({ sessionId: "session" }),
     );
     const initialEvents = await collectCursorSse(initial);
-    const toolStart = initialEvents.find((event) => event.event === "content_block_start"
-      && event.data.content_block?.type === "tool_use");
+    const toolStart = getToolUseStartEvent(initialEvents);
 
     expect(toolStart?.data.content_block.name).toBe("Bash");
     expect(toolStart?.data.content_block.id).toStartWith("call_cursor_");
-    const toolInputDelta = initialEvents.find((event) => event.event === "content_block_delta"
-      && event.data.delta?.type === "input_json_delta");
+    const toolInputDelta = getInputJsonDeltaEvent(initialEvents);
     expect(JSON.parse(toolInputDelta?.data.delta.partial_json).command).toBe(
       "cd '/tmp/cursor bridge cwd' && printf should-not-run",
     );
-    expect(initialEvents.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe("tool_use");
+    expectMessageStopReason(initialEvents, "tool_use");
     expect(sentFrames.some((message) => message.execClientMessage?.shellStream?.stdout)).toBe(false);
 
     const resume = await provider.handleMessages(
@@ -261,71 +311,47 @@ describe("Cursor provider messages", () => {
     expect(sentFrames.some((message) =>
       message.execClientMessage?.shellStream?.stdout?.data === "should-not-run"
     )).toBe(false);
-    expect(resumeEvents.find((event) => event.event === "content_block_delta")?.data.delta.text).toBe(
-      "resumed after native shell",
-    );
-    expect(resumeEvents.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe("end_turn");
-    expect(resumeEvents.at(-1)?.event).toBe("message_stop");
+    expect(getTextDeltaEvent(resumeEvents)?.data.delta.text).toBe("resumed after native shell");
+    expectMessageStopReason(resumeEvents, "end_turn");
+    expectMessageStop(resumeEvents);
   });
 
   it("denies Cursor shellStreamArgs instead of executing internally when Claude did not advertise Bash", async () => {
-    let serverController!: ReadableStreamDefaultController<Uint8Array>;
-    const sentFrames: Array<Record<string, any>> = [];
     let finalResponseSent = false;
     const dir = await mkdtemp(join(tmpdir(), "cursor-denied-shell-"));
     const file = join(dir, "hidden-edit.txt");
-    const serverReadable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        serverController = controller;
-        queueMicrotask(() => {
-          controller.enqueue(frame({
+    const { sentFrames, runAgent } = createRunStreamHarness(
+      {
+        message: {
+          case: "execServerMessage",
+          value: {
+            id: 13,
+            execId: "exec-shell-denied",
             message: {
-              case: "execServerMessage",
+              case: "shellStreamArgs",
               value: {
-                id: 13,
-                execId: "exec-shell-denied",
-                message: {
-                  case: "shellStreamArgs",
-                  value: {
-                    command: `printf hidden > ${JSON.stringify(file)}`,
-                    workingDirectory: dir,
-                    timeout: 5000,
-                  },
-                },
+                command: `printf hidden > ${JSON.stringify(file)}`,
+                workingDirectory: dir,
+                timeout: 5000,
               },
             },
-          }));
-        });
+          },
+        },
       },
-    });
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async (opts) =>
-        runCursorAgent({
-          ...opts,
-          proto: fakeProto,
-          openRunStream: async () => ({
-            readable: serverReadable,
-            status: Promise.resolve({ status: 200 }),
-            async write(frameBytes) {
-              const message = decodeFrameJson(frameBytes) as Record<string, any>;
-              sentFrames.push(message);
-              if (message.execClientMessage?.shellStream?.exit && !finalResponseSent) {
-                finalResponseSent = true;
-                serverController.enqueue(frame({
-                  interactionUpdate: { textDelta: { text: "shell was denied" } },
-                }));
-                serverController.enqueue(frame({
-                  interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "3" } },
-                }));
-                serverController.close();
-              }
-            },
-            close() {},
-          }),
-        }),
-      proto: fakeProto,
-    });
+      (message, serverController) => {
+        if (message.execClientMessage?.shellStream?.exit && !finalResponseSent) {
+          finalResponseSent = true;
+          serverController.enqueue(frame({
+            interactionUpdate: { textDelta: { text: "shell was denied" } },
+          }));
+          serverController.enqueue(frame({
+            interactionUpdate: { turnEnded: { inputTokens: "4", outputTokens: "3" } },
+          }));
+          serverController.close();
+        }
+      },
+    );
+    const provider = createCursorTestProvider(runAgent);
 
     const response = await provider.handleMessages(
       {
@@ -347,69 +373,47 @@ describe("Cursor provider messages", () => {
     expect(sentFrames.find((message) => message.execClientMessage?.shellStream?.exit)
       ?.execClientMessage.shellStream.exit.code).toBe(1);
     expect(await exists(file)).toBe(false);
-    expect(events.find((event) => event.event === "content_block_delta")?.data.delta.text).toBe("shell was denied");
-    expect(events.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe("end_turn");
+    expect(getTextDeltaEvent(events)?.data.delta.text).toBe("shell was denied");
+    expectMessageStopReason(events, "end_turn");
   });
 
   it("bridges Cursor writeArgs through Claude Write tool_use and resumes from tool_result", async () => {
-    let serverController!: ReadableStreamDefaultController<Uint8Array>;
-    const sentFrames: Array<Record<string, any>> = [];
     let finalResponseSent = false;
     const dir = await mkdtemp(join(tmpdir(), "cursor-write-bridge-"));
     const file = join(dir, "history", "findings.md");
     const fileContent = "finding one\nfinding two\n";
-    const serverReadable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        serverController = controller;
-        queueMicrotask(() => {
-          controller.enqueue(frame({
+    const { sentFrames, runAgent } = createRunStreamHarness(
+      {
+        message: {
+          case: "execServerMessage",
+          value: {
+            id: 12,
+            execId: "exec-write",
             message: {
-              case: "execServerMessage",
+              case: "writeArgs",
               value: {
-                id: 12,
-                execId: "exec-write",
-                message: {
-                  case: "writeArgs",
-                  value: {
-                    path: file,
-                    fileText: fileContent,
-                    returnFileContentAfterWrite: true,
-                  },
-                },
+                path: file,
+                fileText: fileContent,
+                returnFileContentAfterWrite: true,
               },
             },
-          }));
-        });
+          },
+        },
       },
-    });
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async (opts) =>
-        runCursorAgent({
-          ...opts,
-          proto: fakeProto,
-          openRunStream: async () => ({
-            readable: serverReadable,
-            status: Promise.resolve({ status: 200 }),
-            async write(frameBytes) {
-              const message = decodeFrameJson(frameBytes) as Record<string, any>;
-              sentFrames.push(message);
-              if (message.execClientMessage?.writeResult?.success && !finalResponseSent) {
-                finalResponseSent = true;
-                serverController.enqueue(frame({
-                  interactionUpdate: { textDelta: { text: "resumed after native write" } },
-                }));
-                serverController.enqueue(frame({
-                  interactionUpdate: { turnEnded: { inputTokens: "5", outputTokens: "4" } },
-                }));
-                serverController.close();
-              }
-            },
-            close() {},
-          }),
-        }),
-      proto: fakeProto,
-    });
+      (message, serverController) => {
+        if (message.execClientMessage?.writeResult?.success && !finalResponseSent) {
+          finalResponseSent = true;
+          serverController.enqueue(frame({
+            interactionUpdate: { textDelta: { text: "resumed after native write" } },
+          }));
+          serverController.enqueue(frame({
+            interactionUpdate: { turnEnded: { inputTokens: "5", outputTokens: "4" } },
+          }));
+          serverController.close();
+        }
+      },
+    );
+    const provider = createCursorTestProvider(runAgent);
 
     const initial = await provider.handleMessages(
       {
@@ -421,10 +425,8 @@ describe("Cursor provider messages", () => {
       fakeCursorCtx({ sessionId: "session" }),
     );
     const initialEvents = await collectCursorSse(initial);
-    const toolStart = initialEvents.find((event) => event.event === "content_block_start"
-      && event.data.content_block?.type === "tool_use");
-    const toolInputDelta = initialEvents.find((event) => event.event === "content_block_delta"
-      && event.data.delta?.type === "input_json_delta");
+    const toolStart = getToolUseStartEvent(initialEvents);
+    const toolInputDelta = getInputJsonDeltaEvent(initialEvents);
 
     expect(toolStart?.data.content_block.name).toBe("Write");
     expect(toolStart?.data.content_block.id).toStartWith("call_cursor_");
@@ -432,7 +434,7 @@ describe("Cursor provider messages", () => {
       file_path: file,
       content: fileContent,
     });
-    expect(initialEvents.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe("tool_use");
+    expectMessageStopReason(initialEvents, "tool_use");
     expect(sentFrames.some((message) => message.execClientMessage?.writeResult)).toBe(false);
 
     await mkdir(join(dir, "history"), { recursive: true });
@@ -475,16 +477,12 @@ describe("Cursor provider messages", () => {
       fileContentAfterWrite: fileContent,
     });
     expect(sentFrames.at(-1)).toEqual({ execClientControlMessage: { streamClose: { id: 12 } } });
-    expect(resumeEvents.find((event) => event.event === "content_block_delta")?.data.delta.text).toBe(
-      "resumed after native write",
-    );
-    expect(resumeEvents.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe("end_turn");
-    expect(resumeEvents.at(-1)?.event).toBe("message_stop");
+    expect(getTextDeltaEvent(resumeEvents)?.data.delta.text).toBe("resumed after native write");
+    expectMessageStopReason(resumeEvents, "end_turn");
+    expectMessageStop(resumeEvents);
   });
 
   it("bridges Cursor readArgs before writeArgs so Claude Write can edit existing files", async () => {
-    let serverController!: ReadableStreamDefaultController<Uint8Array>;
-    const sentFrames: Array<Record<string, any>> = [];
     let writeRequested = false;
     let finalResponseSent = false;
     const dir = await mkdtemp(join(tmpdir(), "cursor-read-write-bridge-"));
@@ -492,71 +490,51 @@ describe("Cursor provider messages", () => {
     const originalContent = "# Demo\n\nOld detail.\n";
     const updatedContent = "# Demo\n\nUpdated detail.\n";
     await writeFile(file, originalContent, "utf8");
-    const serverReadable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        serverController = controller;
-        queueMicrotask(() => {
-          controller.enqueue(frame({
+    const { sentFrames, runAgent } = createRunStreamHarness(
+      {
+        message: {
+          case: "execServerMessage",
+          value: {
+            id: 21,
+            execId: "exec-read",
+            message: { case: "readArgs", value: { path: file } },
+          },
+        },
+      },
+      (message, serverController) => {
+        if (message.execClientMessage?.readResult?.success && !writeRequested) {
+          writeRequested = true;
+          serverController.enqueue(frame({
             message: {
               case: "execServerMessage",
               value: {
-                id: 21,
-                execId: "exec-read",
-                message: { case: "readArgs", value: { path: file } },
+                id: 22,
+                execId: "exec-write",
+                message: {
+                  case: "writeArgs",
+                  value: {
+                    path: file,
+                    fileText: updatedContent,
+                    returnFileContentAfterWrite: true,
+                  },
+                },
               },
             },
           }));
-        });
+        }
+        if (message.execClientMessage?.writeResult?.success && !finalResponseSent) {
+          finalResponseSent = true;
+          serverController.enqueue(frame({
+            interactionUpdate: { textDelta: { text: "edited existing file" } },
+          }));
+          serverController.enqueue(frame({
+            interactionUpdate: { turnEnded: { inputTokens: "8", outputTokens: "5" } },
+          }));
+          serverController.close();
+        }
       },
-    });
-    const provider = createCursorProvider({
-      loadAuth: async () => ({ accessToken: "token", source: "test" }),
-      runAgent: async (opts) =>
-        runCursorAgent({
-          ...opts,
-          proto: fakeProto,
-          openRunStream: async () => ({
-            readable: serverReadable,
-            status: Promise.resolve({ status: 200 }),
-            async write(frameBytes) {
-              const message = decodeFrameJson(frameBytes) as Record<string, any>;
-              sentFrames.push(message);
-              if (message.execClientMessage?.readResult?.success && !writeRequested) {
-                writeRequested = true;
-                serverController.enqueue(frame({
-                  message: {
-                    case: "execServerMessage",
-                    value: {
-                      id: 22,
-                      execId: "exec-write",
-                      message: {
-                        case: "writeArgs",
-                        value: {
-                          path: file,
-                          fileText: updatedContent,
-                          returnFileContentAfterWrite: true,
-                        },
-                      },
-                    },
-                  },
-                }));
-              }
-              if (message.execClientMessage?.writeResult?.success && !finalResponseSent) {
-                finalResponseSent = true;
-                serverController.enqueue(frame({
-                  interactionUpdate: { textDelta: { text: "edited existing file" } },
-                }));
-                serverController.enqueue(frame({
-                  interactionUpdate: { turnEnded: { inputTokens: "8", outputTokens: "5" } },
-                }));
-                serverController.close();
-              }
-            },
-            close() {},
-          }),
-        }),
-      proto: fakeProto,
-    });
+    );
+    const provider = createCursorTestProvider(runAgent);
 
     const initial = await provider.handleMessages(
       {
@@ -571,10 +549,8 @@ describe("Cursor provider messages", () => {
       fakeCursorCtx({ sessionId: "session" }),
     );
     const initialEvents = await collectCursorSse(initial);
-    const readToolStart = initialEvents.find((event) => event.event === "content_block_start"
-      && event.data.content_block?.type === "tool_use");
-    const readToolInput = initialEvents.find((event) => event.event === "content_block_delta"
-      && event.data.delta?.type === "input_json_delta");
+    const readToolStart = getToolUseStartEvent(initialEvents);
+    const readToolInput = getInputJsonDeltaEvent(initialEvents);
 
     expect(readToolStart?.data.content_block.name).toBe("Read");
     expect(JSON.parse(readToolInput?.data.delta.partial_json)).toEqual({ file_path: file });
@@ -610,10 +586,8 @@ describe("Cursor provider messages", () => {
     const afterReadEvents = await collectCursorSse(afterRead);
     const readResult = sentFrames.find((message) => message.execClientMessage?.readResult)
       ?.execClientMessage.readResult.success;
-    const writeToolStart = afterReadEvents.find((event) => event.event === "content_block_start"
-      && event.data.content_block?.type === "tool_use");
-    const writeToolInput = afterReadEvents.find((event) => event.event === "content_block_delta"
-      && event.data.delta?.type === "input_json_delta");
+    const writeToolStart = getToolUseStartEvent(afterReadEvents);
+    const writeToolInput = getInputJsonDeltaEvent(afterReadEvents);
 
     expect(readResult).toEqual({
       path: file,
@@ -665,12 +639,8 @@ describe("Cursor provider messages", () => {
       fileSize: 24,
       fileContentAfterWrite: updatedContent,
     });
-    expect(afterWriteEvents.find((event) => event.event === "content_block_delta")?.data.delta.text).toBe(
-      "edited existing file",
-    );
-    expect(afterWriteEvents.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe(
-      "end_turn",
-    );
+    expect(getTextDeltaEvent(afterWriteEvents)?.data.delta.text).toBe("edited existing file");
+    expectMessageStopReason(afterWriteEvents, "end_turn");
   });
 });
 
