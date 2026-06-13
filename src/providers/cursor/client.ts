@@ -630,6 +630,44 @@ function lineCount(content: string): number {
   return content.length === 0 ? 0 : content.split("\n").length;
 }
 
+export interface CursorNativeToolResult {
+  content: string;
+  isError: boolean;
+}
+
+export function buildCursorReadResultFromNativeToolResult(
+  result: CursorNativeToolResult,
+): CursorReadToolResult {
+  return {
+    success: !result.isError,
+    error: result.isError ? result.content : undefined,
+  };
+}
+
+export function buildCursorWriteResultFromNativeToolResult(
+  result: CursorNativeToolResult,
+): CursorWriteResult {
+  if (!result.isError) return { success: true };
+  return {
+    success: false,
+    error: result.content || "Write tool failed",
+  };
+}
+
+export function buildCursorShellStreamResultFromNativeToolResult(
+  result: CursorNativeToolResult,
+  startedAt: number,
+  cwd: string,
+): CursorShellStreamResult {
+  return {
+    stdout: result.isError ? undefined : result.content,
+    stderr: result.isError ? result.content : undefined,
+    exitCode: result.isError ? 1 : 0,
+    cwd,
+    localExecutionTimeMs: Date.now() - startedAt,
+  };
+}
+
 export async function appendCursorReadResult(
   exec: CursorReadExec,
   result: CursorReadToolResult,

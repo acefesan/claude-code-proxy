@@ -6,9 +6,13 @@ import {
   appendCursorReadResult,
   appendCursorShellStreamResult,
   appendCursorWriteResult,
+  buildCursorReadResultFromNativeToolResult,
+  buildCursorShellStreamResultFromNativeToolResult,
+  buildCursorWriteResultFromNativeToolResult,
   cursorReadArgs,
   cursorShellStreamArgs,
   cursorWriteArgs,
+  type CursorNativeToolResult,
   decodeCursorStream,
   type CursorAppendMessage,
   type CursorReadExec,
@@ -25,8 +29,8 @@ interface PendingToolBase {
   toolUseId: string;
   startedAt: number;
   append: CursorAppendMessage;
-  resolve(result: NativeToolResult): void;
-  result: Promise<NativeToolResult>;
+  resolve(result: CursorNativeToolResult): void;
+  result: Promise<CursorNativeToolResult>;
 }
 
 interface PendingReadTool extends PendingToolBase {
@@ -51,11 +55,6 @@ interface PendingWriteTool extends PendingToolBase {
 }
 
 type PendingNativeTool = PendingReadTool | PendingShellTool | PendingWriteTool;
-
-interface NativeToolResult {
-  content: string;
-  isError: boolean;
-}
 
 interface CursorBridgeState {
   sessionId: string;
@@ -161,8 +160,8 @@ export function createCursorShellToolBridge(opts: {
     async readHandler(exec, append) {
       const { path } = cursorReadArgs(exec);
       const toolUseId = `call_cursor_${crypto.randomUUID().replace(/-/g, "")}`;
-      let resolve!: (result: NativeToolResult) => void;
-      const result = new Promise<NativeToolResult>((r) => {
+      let resolve!: (result: CursorNativeToolResult) => void;
+      const result = new Promise<CursorNativeToolResult>((r) => {
         resolve = r;
       });
       const tool: PendingReadTool = {
@@ -184,10 +183,7 @@ export function createCursorShellToolBridge(opts: {
       const readResult = await result;
       await appendCursorReadResult(
         exec,
-        {
-          success: !readResult.isError,
-          error: readResult.isError ? readResult.content : undefined,
-        },
+        buildCursorReadResultFromNativeToolResult(readResult),
         append,
       );
       opts.traffic?.writeJsonEvent("038-cursor-tool-bridge-resume", {
@@ -200,8 +196,8 @@ export function createCursorShellToolBridge(opts: {
     async shellStreamHandler(exec, append) {
       const { command, workingDirectory, timeoutMs } = cursorShellStreamArgs(exec);
       const toolUseId = `call_cursor_${crypto.randomUUID().replace(/-/g, "")}`;
-      let resolve!: (result: NativeToolResult) => void;
-      const result = new Promise<NativeToolResult>((r) => {
+      let resolve!: (result: CursorNativeToolResult) => void;
+      const result = new Promise<CursorNativeToolResult>((r) => {
         resolve = r;
       });
       const tool: PendingShellTool = {
@@ -227,13 +223,11 @@ export function createCursorShellToolBridge(opts: {
       const shellResult = await result;
       await appendCursorShellStreamResult(
         exec,
-        {
-          stdout: shellResult.isError ? undefined : shellResult.content,
-          stderr: shellResult.isError ? shellResult.content : undefined,
-          exitCode: shellResult.isError ? 1 : 0,
-          cwd: workingDirectory,
-          localExecutionTimeMs: Date.now() - tool.startedAt,
-        },
+        buildCursorShellStreamResultFromNativeToolResult(
+          shellResult,
+          tool.startedAt,
+          workingDirectory,
+        ),
         append,
       );
       opts.traffic?.writeJsonEvent("038-cursor-tool-bridge-resume", {
@@ -246,8 +240,8 @@ export function createCursorShellToolBridge(opts: {
     async writeHandler(exec, append) {
       const { path, content } = cursorWriteArgs(exec);
       const toolUseId = `call_cursor_${crypto.randomUUID().replace(/-/g, "")}`;
-      let resolve!: (result: NativeToolResult) => void;
-      const result = new Promise<NativeToolResult>((r) => {
+      let resolve!: (result: CursorNativeToolResult) => void;
+      const result = new Promise<CursorNativeToolResult>((r) => {
         resolve = r;
       });
       const tool: PendingWriteTool = {
@@ -269,14 +263,7 @@ export function createCursorShellToolBridge(opts: {
       });
       notifyTool(tool);
       const writeResult = await result;
-      await appendCursorWriteResult(
-        exec,
-        {
-          success: !writeResult.isError,
-          error: writeResult.isError ? writeResult.content : undefined,
-        },
-        append,
-      );
+      await appendCursorWriteResult(exec, buildCursorWriteResultFromNativeToolResult(writeResult), append);
       opts.traffic?.writeJsonEvent("038-cursor-tool-bridge-resume", {
         kind: tool.kind,
         toolUseId,
