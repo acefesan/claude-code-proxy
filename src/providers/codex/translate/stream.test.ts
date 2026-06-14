@@ -73,6 +73,50 @@ function collectWithTime(chunks: string[]): Promise<string> {
   );
 }
 
+function webSearchChunks(): string[] {
+  return [
+    sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "web_search_call", id: "ws_1", status: "in_progress" },
+    }),
+    sse("response.web_search_call.in_progress", { output_index: 0, item_id: "ws_1" }),
+    sse("response.web_search_call.searching", { output_index: 0, item_id: "ws_1" }),
+    sse("response.web_search_call.completed", { output_index: 0, item_id: "ws_1" }),
+    sse("response.output_item.done", {
+      output_index: 0,
+      item: {
+        type: "web_search_call",
+        id: "ws_1",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "claude-code-proxy github",
+          queries: ["claude-code-proxy github"],
+        },
+      },
+    }),
+    sse("response.output_item.added", {
+      output_index: 1,
+      item: { type: "message", id: "msg_upstream" },
+    }),
+    sse("response.output_text.delta", {
+      output_index: 1,
+      delta:
+        "1. **TechRadar security article** - warns about malware.\n   https://www.techradar.com/pro/security/example\n",
+    }),
+    sse("response.output_text.delta", {
+      output_index: 1,
+      delta:
+        "2. **The Verge GitHub Claude/Codex agents article** - covers agents.\n   https://www.theverge.com/news/873665/github-claude-codex-ai-agents",
+    }),
+    sse("response.output_item.done", {
+      output_index: 1,
+      item: { type: "message", id: "msg_upstream" },
+    }),
+    sse("response.completed", { response: { usage: { input_tokens: 10, output_tokens: 5 } } }),
+  ];
+}
+
 describe("translateStream", () => {
   it("emits keepalive pings while Read arguments are buffered", async () => {
     const chunks = [
@@ -185,6 +229,25 @@ describe("translateStream", () => {
     expect(output).toContain('"stop_reason":"tool_use"');
     expect(output).toContain("event: message_stop");
     expect(output).not.toContain("event: error");
+  });
+
+  it("emits Anthropic web search blocks and usage for Codex hosted web search", async () => {
+    const output = await collectFromChunks(webSearchChunks());
+
+    expect(output).toContain('"type":"server_tool_use"');
+    expect(output).toContain('"id":"srvtoolu_ws_1"');
+    expect(output).toContain('"name":"web_search"');
+    expect(output).toContain('"partial_json":"{\\"query\\":\\"claude-code-proxy github\\"}"');
+    expect(output).toContain('"type":"web_search_tool_result"');
+    expect(output).toContain('"tool_use_id":"srvtoolu_ws_1"');
+    expect(output).toContain('"title":"TechRadar security article"');
+    expect(output).toContain('"url":"https://www.techradar.com/pro/security/example"');
+    expect(output).toContain('"web_search_requests":1');
+    expect(output).toContain("event: message_stop");
+    expect(output).not.toContain("event: error");
+    expect(output.indexOf('"type":"web_search_tool_result"')).toBeLessThan(
+      output.indexOf('"type":"text_delta"'),
+    );
   });
 
   it("fails buffered Read arguments that exceed the safe duration", async () => {

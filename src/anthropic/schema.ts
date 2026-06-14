@@ -29,6 +29,29 @@ export interface AnthropicThinkingBlock {
   signature?: string;
 }
 
+export interface AnthropicServerToolUseBlock {
+  type: "server_tool_use";
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+export interface AnthropicWebSearchResultBlock {
+  type: "web_search_result";
+  url: string;
+  title: string;
+  encrypted_content?: string;
+  page_age?: string | null;
+}
+
+export interface AnthropicWebSearchToolResultBlock {
+  type: "web_search_tool_result";
+  tool_use_id: string;
+  content:
+    | AnthropicWebSearchResultBlock[]
+    | { type: "web_search_tool_result_error"; error_code: string };
+}
+
 export type AnthropicToolResultContentBlock =
   | AnthropicTextBlock
   | AnthropicImageBlock
@@ -42,7 +65,9 @@ export type AnthropicContentBlock =
   | AnthropicImageBlock
   | AnthropicToolUseBlock
   | AnthropicToolResultBlock
-  | AnthropicThinkingBlock;
+  | AnthropicThinkingBlock
+  | AnthropicServerToolUseBlock
+  | AnthropicWebSearchToolResultBlock;
 
 export interface AnthropicMessage {
   role: "user" | "assistant" | "system";

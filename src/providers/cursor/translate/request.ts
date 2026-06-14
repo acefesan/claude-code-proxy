@@ -91,6 +91,10 @@ function renderBlock(block: AnthropicContentBlock): string {
       return `<tool_use id="${block.id}" name="${block.name}">\n${JSON.stringify(block.input ?? {})}\n</tool_use>`;
     case "tool_result":
       return `<tool_result tool_use_id="${block.tool_use_id}"${block.is_error ? ' is_error="true"' : ""}>\n${renderToolResult(block.content)}\n</tool_result>`;
+    case "server_tool_use":
+      return `<server_tool_use id="${block.id}" name="${block.name}">\n${JSON.stringify(block.input ?? {})}\n</server_tool_use>`;
+    case "web_search_tool_result":
+      return `<web_search_tool_result tool_use_id="${block.tool_use_id}">\n${JSON.stringify(block.content)}\n</web_search_tool_result>`;
   }
 }
 

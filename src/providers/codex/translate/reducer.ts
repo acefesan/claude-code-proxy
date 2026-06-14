@@ -5,6 +5,7 @@ import type { TrafficCapture } from "../../types.ts";
 import type { TextToolReducerEvent } from "../../translate/accumulate.ts";
 import { mapCachedInputUsageToAnthropicUsage } from "../../translate/accumulate.ts";
 import type { ResponsesInputItem } from "./request.ts";
+import { serverToolUseIdFromCodexWebSearchId } from "./web-search-compat.ts";
 
 export class UpstreamStreamError extends Error {
   constructor(
@@ -32,11 +33,19 @@ export type ReducerEvent =
   | { kind: "tool-progress"; index: number }
   | { kind: "progress" }
   | {
+      kind: "web-search";
+      index: number;
+      resultIndex: number;
+      id: string;
+      query: string;
+    }
+  | {
       kind: "finish";
       stopReason: StopReason;
       terminalType: TerminalType;
       continuationEligible: boolean;
       usage: CodexUsage | undefined;
+      webSearchRequests: number;
       responseId?: string;
       outputItems: ResponsesInputItem[];
     };
@@ -233,6 +242,7 @@ export async function* reduceUpstream(
   let terminalType: TerminalType | undefined;
   let continuationEligible = false;
   let incomplete = false;
+  let webSearchRequests = 0;
 
   function canFinishAfterClosedCompletedToolCall(err: unknown): boolean {
     return (
@@ -431,6 +441,19 @@ export async function* reduceUpstream(
 
     if (t === "response.output_item.done") {
       const item = p.item;
+      if (item?.type === "web_search_call") {
+        const idx = anthropicIndex++;
+        const resultIndex = anthropicIndex++;
+        webSearchRequests += 1;
+        yield {
+          kind: "web-search",
+          index: idx,
+          resultIndex,
+          id: serverToolUseIdFromCodexWebSearchId(item.id),
+          query: webSearchQuery(item),
+        };
+        continue;
+      }
       const state = blocksByOutputIndex.get(p.output_index);
       if (!state) continue;
       if (!item) {
@@ -530,9 +553,24 @@ export async function* reduceUpstream(
     terminalType: terminalType ?? "response.incomplete",
     continuationEligible,
     usage: finalUsage,
+    webSearchRequests,
     responseId,
     outputItems,
   };
+}
+
+function webSearchQuery(item: unknown): string {
+  if (!item || typeof item !== "object") return "";
+  const action = (item as { action?: unknown }).action;
+  if (!action || typeof action !== "object") return "";
+  const query = (action as { query?: unknown }).query;
+  if (typeof query === "string") return query;
+  const queries = (action as { queries?: unknown }).queries;
+  if (Array.isArray(queries)) {
+    const first = queries.find((value): value is string => typeof value === "string");
+    return first ?? "";
+  }
+  return "";
 }
 
 function isCodexWebSocketCloseError(err: unknown): boolean {
@@ -549,20 +587,28 @@ function upstreamReadError(err: unknown): Error {
   return new UpstreamStreamError("failed", `Upstream stream read failed: ${message}`);
 }
 
-export function mapUsageToAnthropic(u: CodexUsage | undefined): {
+export function mapUsageToAnthropic(
+  u: CodexUsage | undefined,
+  opts: { webSearchRequests?: number } = {},
+): {
   input_tokens: number;
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
+  server_tool_use?: { web_search_requests?: number };
 } {
   // OpenAI-style usage reports cached prompt tokens inside input_tokens.
   // Anthropic-style usage reports cache reads separately, and Claude Code
   // sums input_tokens + cache_read_input_tokens when deciding context size.
   // Subtract cached reads here so the downstream total matches the real
   // prompt window instead of double-counting cached context.
-  return mapCachedInputUsageToAnthropicUsage({
+  const usage = mapCachedInputUsageToAnthropicUsage({
     inputTokens: u?.input_tokens,
     outputTokens: u?.output_tokens,
     cachedInputTokens: u?.input_tokens_details?.cached_tokens,
   });
+  if (opts.webSearchRequests && opts.webSearchRequests > 0) {
+    usage.server_tool_use = { web_search_requests: opts.webSearchRequests };
+  }
+  return usage;
 }

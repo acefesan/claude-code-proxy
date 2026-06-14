@@ -38,6 +38,7 @@ describe("reduceUpstream finish metadata", () => {
       terminalType: "response.completed",
       continuationEligible: true,
       usage: { input_tokens: 3 },
+      webSearchRequests: 0,
       responseId: "resp_1",
       outputItems: [
         { type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] },
@@ -72,6 +73,7 @@ describe("reduceUpstream finish metadata", () => {
       stopReason: "tool_use",
       terminalType: "response.completed",
       continuationEligible: true,
+      webSearchRequests: 0,
       responseId: "resp_1",
       outputItems: [
         {
@@ -109,13 +111,21 @@ describe("reduceUpstream finish metadata", () => {
       sse("response.completed", { response: { id: "resp_1", usage: { input_tokens: 3 } } }),
     ]);
 
-    expect(out.filter((event) => event.kind === "progress").length).toBeGreaterThanOrEqual(4);
+    expect(out.filter((event) => event.kind === "progress").length).toBeGreaterThanOrEqual(3);
+    expect(out).toContainEqual({
+      kind: "web-search",
+      index: 0,
+      resultIndex: 1,
+      id: "srvtoolu_ws_1",
+      query: "",
+    });
     expect(out.at(-1)).toEqual({
       kind: "finish",
       stopReason: "end_turn",
       terminalType: "response.completed",
       continuationEligible: true,
       usage: { input_tokens: 3 },
+      webSearchRequests: 1,
       responseId: "resp_1",
       outputItems: [
         {
@@ -159,6 +169,7 @@ describe("reduceUpstream finish metadata", () => {
       terminalType: "response.incomplete",
       continuationEligible: false,
       usage: undefined,
+      webSearchRequests: 0,
       responseId: undefined,
       outputItems: [
         {
@@ -186,6 +197,7 @@ describe("reduceUpstream finish metadata", () => {
       stopReason: "end_turn",
       terminalType: "response.done",
       continuationEligible: true,
+      webSearchRequests: 0,
       responseId: "resp_1",
       outputItems: [],
     });
@@ -208,6 +220,7 @@ describe("reduceUpstream finish metadata", () => {
       stopReason: "max_tokens",
       terminalType: "response.incomplete",
       continuationEligible: false,
+      webSearchRequests: 0,
       responseId: "resp_1",
       outputItems: [],
     });

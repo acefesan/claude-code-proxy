@@ -267,7 +267,10 @@ the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`lo
 precedence and can also force `none`.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
-Responses `web_search` tool, including non-empty domain filters.
+Responses `web_search` tool, including non-empty domain filters. Codex hosted
+search calls are emitted back to Claude Code as Anthropic `server_tool_use` and
+`web_search_tool_result` blocks with `usage.server_tool_use.web_search_requests`
+so Claude Code can account for completed searches.
 
 Confirmed working on **Plus**:
 

@@ -38,16 +38,43 @@ export interface AnthropicNonStreamUsage {
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
+  server_tool_use?: {
+    web_search_requests?: number;
+  };
 }
 
 export type AnthropicTextContent = { type: "text"; text: string };
 export type AnthropicThinkingContent = { type: "thinking"; thinking: string; signature: string };
-export type AnthropicToolUseContent = { type: "tool_use"; id: string; name: string; input: unknown };
+export type AnthropicToolUseContent = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: unknown;
+};
+export type AnthropicServerToolUseContent = {
+  type: "server_tool_use";
+  id: string;
+  name: "web_search";
+  input: { query: string };
+};
+export type AnthropicWebSearchResultContent = {
+  type: "web_search_result";
+  title: string;
+  url: string;
+  page_age?: string | null;
+};
+export type AnthropicWebSearchToolResultContent = {
+  type: "web_search_tool_result";
+  tool_use_id: string;
+  content: AnthropicWebSearchResultContent[];
+};
 
 export type AnthropicNonStreamContent =
   | AnthropicTextContent
   | AnthropicThinkingContent
-  | AnthropicToolUseContent;
+  | AnthropicToolUseContent
+  | AnthropicServerToolUseContent
+  | AnthropicWebSearchToolResultContent;
 
 export interface AnthropicNonStreamResponse<ContentType = AnthropicNonStreamContent> {
   id: string;

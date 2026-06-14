@@ -4,12 +4,13 @@ import type { Logger } from "../../../log.ts";
 import type { TrafficCapture } from "../../types.ts";
 import { attachTrafficCapture, createUpstreamStreamDiagnostics } from "./reducer.ts";
 import {
-  collectAnthropicContentFromAccumulatedBlocks,
   AnthropicNonStreamResponse,
+  type AnthropicNonStreamContent,
   createBlockAccumulator,
   defaultAnthropicNonStreamUsage,
   parseToolInputJsonOrRaw,
 } from "../../translate/accumulate.ts";
+import { buildWebSearchCompatBlocks } from "./web-search-compat.ts";
 
 export { UpstreamStreamError } from "./reducer.ts";
 
@@ -42,6 +43,7 @@ export async function accumulateResponse(
   let continuationEligible = false;
   let responseId: string | undefined;
   let outputItems: FinishEvent["outputItems"] = [];
+  const webSearchEvents: Array<Extract<ReducerEvent, { kind: "web-search" }>> = [];
 
   const diagnostics = attachTrafficCapture(createUpstreamStreamDiagnostics(), opts.traffic);
 
@@ -61,13 +63,16 @@ export async function accumulateResponse(
         blockAccumulator.onToolDelta(e.index, e.partialJson);
         break;
       }
+      case "web-search":
+        webSearchEvents.push(e);
+        break;
       case "text-stop":
       case "tool-stop":
         break;
       case "finish":
         stopReason = e.stopReason;
         rawUsage = e.usage;
-        usage = mapUsageToAnthropic(e.usage);
+        usage = mapUsageToAnthropic(e.usage, { webSearchRequests: e.webSearchRequests });
         terminalType = e.terminalType;
         continuationEligible = e.continuationEligible;
         responseId = e.responseId;
@@ -76,18 +81,30 @@ export async function accumulateResponse(
     }
   }
 
-  const content = collectAnthropicContentFromAccumulatedBlocks<AnthropicNonStreamResponse["content"][number]>(
-    blockAccumulator.orderedBlocks(),
-    {
-      onText: (_index, text) => (text ? { type: "text", text } : undefined),
-      onTool: (_index, id, name, args) => ({
-        type: "tool_use",
-        id,
-        name,
-        input: parseToolInputJsonOrRaw(args),
-      }),
-    },
-  );
+  const accumulatedBlocks = blockAccumulator.orderedBlocks();
+  const text = accumulatedBlocks
+    .flatMap((block) => (block.kind === "text" ? [block.text] : []))
+    .join("");
+  const indexedContent: Array<{ index: number; content: AnthropicNonStreamContent }> = [
+    ...buildWebSearchCompatBlocks(webSearchEvents, text),
+  ];
+  for (const block of accumulatedBlocks) {
+    if (block.kind === "text") {
+      if (block.text)
+        indexedContent.push({ index: block.index, content: { type: "text", text: block.text } });
+    } else if (block.kind === "tool") {
+      indexedContent.push({
+        index: block.index,
+        content: {
+          type: "tool_use",
+          id: block.id,
+          name: block.name,
+          input: parseToolInputJsonOrRaw(block.args),
+        },
+      });
+    }
+  }
+  const content = indexedContent.sort((a, b) => a.index - b.index).map((item) => item.content);
 
   return {
     rawUsage,

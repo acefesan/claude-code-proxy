@@ -14,6 +14,7 @@ import {
   type ReducerEvent,
 } from "./reducer.ts";
 import { emitMessageStart } from "../../shared/anthropic-sse.ts";
+import { buildWebSearchCompatBlocks } from "./web-search-compat.ts";
 
 /**
  * Translate a Codex Responses SSE stream into Anthropic SSE events.
@@ -51,6 +52,8 @@ export function translateStream(
       let lastEmitAt = 0;
       let lastEmitEvent: string | undefined;
       let lastReducerEvent: string | undefined;
+      const webSearchEvents: Array<Extract<ReducerEvent, { kind: "web-search" }>> = [];
+      const deferredContentEvents: ReducerEvent[] = [];
       const startedAt = Date.now();
       const safeClose = () => {
         if (closed) return;
@@ -112,61 +115,136 @@ export function translateStream(
         messageStarted = true;
         emitMessageStart(emit, { messageId: opts.messageId, model: opts.model });
       };
+      const textFromDeferredContent = () =>
+        deferredContentEvents
+          .flatMap((event) => (event.kind === "text-delta" ? [event.text] : []))
+          .join("");
+      const emitWebSearchCompatBlocks = () => {
+        if (!webSearchEvents.length) return;
+        ensureMessageStart();
+        for (const block of buildWebSearchCompatBlocks(
+          webSearchEvents,
+          textFromDeferredContent(),
+        )) {
+          if (block.content.type === "server_tool_use") {
+            emit("content_block_start", {
+              type: "content_block_start",
+              index: block.index,
+              content_block: {
+                type: "server_tool_use",
+                id: block.content.id,
+                name: block.content.name,
+                input: {},
+              },
+            });
+            emit("content_block_delta", {
+              type: "content_block_delta",
+              index: block.index,
+              delta: {
+                type: "input_json_delta",
+                partial_json: JSON.stringify(block.content.input),
+              },
+            });
+            emit("content_block_stop", { type: "content_block_stop", index: block.index });
+            continue;
+          }
+          emit("content_block_start", {
+            type: "content_block_start",
+            index: block.index,
+            content_block: block.content,
+          });
+          emit("content_block_stop", { type: "content_block_stop", index: block.index });
+        }
+      };
+      const isContentEvent = (event: ReducerEvent): boolean =>
+        event.kind === "text-start" ||
+        event.kind === "text-delta" ||
+        event.kind === "text-stop" ||
+        event.kind === "tool-start" ||
+        event.kind === "tool-delta" ||
+        event.kind === "tool-stop";
+      const emitContentEvent = (e: ReducerEvent) => {
+        switch (e.kind) {
+          case "text-start":
+            openBlocks.set(e.index, { type: "text" });
+            ensureMessageStart();
+            emit("content_block_start", {
+              type: "content_block_start",
+              index: e.index,
+              content_block: { type: "text", text: "" },
+            });
+            break;
+          case "text-delta":
+            emit("content_block_delta", {
+              type: "content_block_delta",
+              index: e.index,
+              delta: { type: "text_delta", text: e.text },
+            });
+            break;
+          case "text-stop":
+            openBlocks.delete(e.index);
+            emit("content_block_stop", { type: "content_block_stop", index: e.index });
+            break;
+          case "tool-start":
+            openBlocks.set(e.index, { type: "tool", id: e.id, name: e.name });
+            ensureMessageStart();
+            emit("content_block_start", {
+              type: "content_block_start",
+              index: e.index,
+              content_block: {
+                type: "tool_use",
+                id: e.id,
+                name: e.name,
+                input: {},
+              },
+            });
+            break;
+          case "tool-delta":
+            emit("content_block_delta", {
+              type: "content_block_delta",
+              index: e.index,
+              delta: { type: "input_json_delta", partial_json: e.partialJson },
+            });
+            break;
+          case "tool-stop":
+            openBlocks.delete(e.index);
+            emit("content_block_stop", { type: "content_block_stop", index: e.index });
+            break;
+        }
+      };
 
       try {
         for await (const e of reduceUpstream(upstream, opts.log, diagnostics)) {
           lastReducerEvent = e.kind;
+          if (e.kind === "web-search") {
+            webSearchEvents.push(e);
+            continue;
+          }
+          if (webSearchEvents.length && isContentEvent(e)) {
+            deferredContentEvents.push(e);
+            continue;
+          }
           switch (e.kind) {
             case "text-start":
-              openBlocks.set(e.index, { type: "text" });
-              ensureMessageStart();
-              emit("content_block_start", {
-                type: "content_block_start",
-                index: e.index,
-                content_block: { type: "text", text: "" },
-              });
-              break;
             case "text-delta":
-              emit("content_block_delta", {
-                type: "content_block_delta",
-                index: e.index,
-                delta: { type: "text_delta", text: e.text },
-              });
-              break;
             case "text-stop":
-              openBlocks.delete(e.index);
-              emit("content_block_stop", { type: "content_block_stop", index: e.index });
-              break;
             case "tool-start":
-              openBlocks.set(e.index, { type: "tool", id: e.id, name: e.name });
-              ensureMessageStart();
-              emit("content_block_start", {
-                type: "content_block_start",
-                index: e.index,
-                content_block: {
-                  type: "tool_use",
-                  id: e.id,
-                  name: e.name,
-                  input: {},
-                },
-              });
-              break;
             case "tool-delta":
-              emit("content_block_delta", {
-                type: "content_block_delta",
-                index: e.index,
-                delta: { type: "input_json_delta", partial_json: e.partialJson },
-              });
+            case "tool-stop":
+              emitContentEvent(e);
               break;
             case "tool-progress":
             case "progress":
               emitPingIfStale();
               break;
-            case "tool-stop":
-              openBlocks.delete(e.index);
-              emit("content_block_stop", { type: "content_block_stop", index: e.index });
-              break;
             case "finish":
+              if (openBlocks.size) {
+                throw new UpstreamStreamError("failed", "Stream finished with open content blocks");
+              }
+              emitWebSearchCompatBlocks();
+              for (const event of deferredContentEvents) {
+                emitContentEvent(event);
+              }
               if (openBlocks.size) {
                 throw new UpstreamStreamError("failed", "Stream finished with open content blocks");
               }
@@ -175,7 +253,9 @@ export function translateStream(
               emit("message_delta", {
                 type: "message_delta",
                 delta: { stop_reason: e.stopReason, stop_sequence: null },
-                usage: mapUsageToAnthropic(e.usage),
+                usage: mapUsageToAnthropic(e.usage, {
+                  webSearchRequests: e.webSearchRequests,
+                }),
               });
               emit("message_stop", { type: "message_stop" });
               break;
