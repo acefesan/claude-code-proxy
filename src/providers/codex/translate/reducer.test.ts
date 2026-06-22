@@ -86,6 +86,47 @@ describe("reduceUpstream finish metadata", () => {
     });
   });
 
+  it("repairs whitespace-stalled Read function call arguments", async () => {
+    const out = await events([
+      sse("response.output_item.added", {
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_1", name: "Read" },
+      }),
+      sse("response.function_call_arguments.delta", {
+        output_index: 0,
+        delta: '{"file_path":"/tmp/a","limit":2200',
+      }),
+      sse("response.function_call_arguments.delta", {
+        output_index: 0,
+        delta: " ".repeat(1024),
+      }),
+    ]);
+
+    expect(out).toContainEqual({
+      kind: "tool-delta",
+      index: 0,
+      partialJson: '{"file_path":"/tmp/a","limit":2200}',
+    });
+    expect(out).toContainEqual({ kind: "tool-stop", index: 0 });
+    expect(out.at(-1)).toEqual({
+      kind: "finish",
+      stopReason: "tool_use",
+      terminalType: "response.incomplete",
+      continuationEligible: false,
+      usage: undefined,
+      webSearchRequests: 0,
+      responseId: undefined,
+      outputItems: [
+        {
+          type: "function_call",
+          call_id: "call_1",
+          name: "Read",
+          arguments: '{"file_path":"/tmp/a","limit":2200}',
+        },
+      ],
+    });
+  });
+
   it("treats hosted web search response events as progress", async () => {
     const out = await events([
       sse("response.output_item.added", {

@@ -132,6 +132,31 @@ describe("translateStream", () => {
     expect(output).toContain("event: message_stop");
   });
 
+  it("short-circuits whitespace-stalled Read arguments as a tool use", async () => {
+    const chunks = [
+      sse("response.output_item.added", {
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_read", name: "Read" },
+      }),
+      sse("response.function_call_arguments.delta", {
+        output_index: 0,
+        delta: '{"file_path":"/tmp/a","limit":2200',
+      }),
+      sse("response.function_call_arguments.delta", {
+        output_index: 0,
+        delta: " ".repeat(1024),
+      }),
+    ];
+
+    const output = await collectFromChunks(chunks);
+
+    expect(output).toContain("event: content_block_start");
+    expect(output).toContain('"partial_json":"{\\"file_path\\":\\"/tmp/a\\",\\"limit\\":2200}"');
+    expect(output).toContain('"stop_reason":"tool_use"');
+    expect(output).toContain("event: message_stop");
+    expect(output).not.toContain("event: error");
+  });
+
   it("emits keepalive pings for upstream keepalive events", async () => {
     const chunks = [
       sse("response.output_item.added", {

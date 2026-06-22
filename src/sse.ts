@@ -34,10 +34,14 @@ export async function* parseSseStream(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let completed = false;
   try {
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
       stats.bytesRead += value.byteLength;
       stats.chunkCount += 1;
       stats.lastChunkAt = Date.now();
@@ -62,7 +66,9 @@ export async function* parseSseStream(
         yield evt;
       }
     }
+    completed = true;
   } finally {
+    if (!completed) await reader.cancel("SSE parser closed before stream end").catch(() => {});
     reader.releaseLock();
   }
 }

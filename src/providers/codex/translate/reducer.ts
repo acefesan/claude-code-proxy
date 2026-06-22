@@ -76,6 +76,7 @@ const BUFFERED_TOOL_PROGRESS_LOG_INTERVAL_MS = 30_000;
 const BUFFERED_TOOL_LARGE_ARGS_BYTES = 1_000_000;
 const BUFFERED_TOOL_MAX_ARGS_BYTES = 5_000_000;
 const BUFFERED_TOOL_MAX_DURATION_MS = 120_000;
+const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES = 1_024;
 
 function shouldBufferToolArgs(name: string): boolean {
   return name === "Read";
@@ -127,6 +128,61 @@ function toolArgJsonState(args: string): Record<string, unknown> {
       trailingWhitespace: args.length - trimmed.length,
     };
   }
+}
+
+function parseReadArgsCandidate(args: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(args);
+  } catch {
+    return undefined;
+  }
+  if (!isValidReadArgs(parsed)) return undefined;
+  return sanitizeToolArgs("Read", JSON.stringify(parsed));
+}
+
+function isValidReadArgs(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const allowed = new Set(["file_path", "offset", "limit", "pages"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) return false;
+  }
+  const args = value as Record<string, unknown>;
+  if (typeof args.file_path !== "string" || !args.file_path) return false;
+  if (
+    args.offset !== undefined &&
+    (!Number.isSafeInteger(args.offset) || (args.offset as number) < 0)
+  )
+    return false;
+  if (
+    args.limit !== undefined &&
+    (!Number.isSafeInteger(args.limit) || (args.limit as number) <= 0)
+  )
+    return false;
+  if (args.pages !== undefined && typeof args.pages !== "string") return false;
+  return true;
+}
+
+function repairWhitespaceStalledReadArgs(log: Logger, state: ToolState): string | undefined {
+  if (!state.bufferUntilDone || state.name !== "Read") return undefined;
+  const trimmed = state.argsAccum.trimEnd();
+  const trailingWhitespace = state.argsAccum.length - trimmed.length;
+  if (trailingWhitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES) return undefined;
+
+  const repaired = parseReadArgsCandidate(trimmed) ?? parseReadArgsCandidate(`${trimmed}}`);
+  if (!repaired) return undefined;
+
+  log.warn("repairing whitespace-stalled Read tool arguments", {
+    outputIndex: state.outputIndex,
+    index: state.index,
+    callId: state.callId,
+    name: state.name,
+    deltaCount: state.deltaCount,
+    elapsedMs: Date.now() - state.startedAt,
+    args: toolArgSummary(state.argsAccum),
+    repaired: toolArgJsonState(repaired),
+  });
+  return repaired;
 }
 
 function logBufferedToolProgress(log: Logger, state: ToolState, force = false): void {
@@ -411,6 +467,30 @@ export async function* reduceUpstream(
       state.deltaCount += 1;
       state.hadDelta = true;
       logBufferedToolProgress(log, state);
+      const repairedArgs = repairWhitespaceStalledReadArgs(log, state);
+      if (repairedArgs) {
+        state.argsAccum = repairedArgs;
+        state.emittedArgs = true;
+        captureOutputItem(p.output_index, state);
+        yield { kind: "tool-delta", index: state.index, partialJson: state.argsAccum };
+        yield { kind: "tool-stop", index: state.index };
+        blocksByOutputIndex.delete(p.output_index);
+        const outputItems = Array.from(outputItemsByIndex.entries())
+          .sort(([a], [b]) => a - b)
+          .map(([, item]) => item);
+        yield {
+          kind: "finish",
+          stopReason: "tool_use",
+          terminalType: "response.incomplete",
+          continuationEligible: false,
+          usage: undefined,
+          webSearchRequests,
+          responseId: undefined,
+          outputItems,
+        };
+        await events.return?.(undefined);
+        return;
+      }
       throwIfBufferedToolExceeded(log, state);
       if (!state.bufferUntilDone) {
         state.emittedArgs = true;
