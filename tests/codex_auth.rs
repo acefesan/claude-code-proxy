@@ -1,5 +1,4 @@
 use assert_cmd::Command;
-use predicates::str::contains;
 use tempfile::TempDir;
 
 /// Run a codex auth command with a temp config dir that isolates
@@ -23,7 +22,19 @@ fn codex_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error
         auth_dir.join("auth.json"),
         r#"{"access":"a","refresh":"r","expires":4102444800000,"accountId":"acct_1"}"#,
     )?;
-    cmd.assert().success().stdout(contains("Account: acct_1"));
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let out = String::from_utf8(output)?;
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[0], "Account: acct_1");
+    assert!(
+        lines[1].starts_with("Expires: 2100-01-01T00:00:00.000Z (in "),
+        "{out}"
+    );
+    assert!(lines[1].ends_with("s)"), "{out}");
+    assert!(lines[2].starts_with("Storage: "), "{out}");
+    assert!(!out.contains("Auth path:"));
+    assert!(!out.contains("Authenticated: true"));
     Ok(())
 }
 
@@ -36,7 +47,11 @@ fn codex_auth_status_reads_legacy_account_id_key() -> Result<(), Box<dyn std::er
         auth_dir.join("auth.json"),
         r#"{"access":"a","refresh":"r","expires":4102444800000,"account_id":"acct_2"}"#,
     )?;
-    cmd.assert().success().stdout(contains("Account: acct_2"));
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let out = String::from_utf8(output)?;
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[0], "Account: acct_2");
     Ok(())
 }
 
@@ -45,12 +60,12 @@ fn codex_auth_status_no_auth() -> Result<(), Box<dyn std::error::Error>> {
     let (mut cmd, _temp) = codex_cmd();
     let output = cmd.output()?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8(output.stdout)?.contains("Not authenticated"));
+    assert_eq!(String::from_utf8(output.stdout)?, "Not authenticated\n");
     Ok(())
 }
 
 #[test]
-fn codex_auth_status_shows_auth_path() -> Result<(), Box<dyn std::error::Error>> {
+fn codex_auth_status_shows_storage_path() -> Result<(), Box<dyn std::error::Error>> {
     let (mut cmd, temp) = codex_cmd();
     let auth_dir = temp.path().join("codex");
     std::fs::create_dir_all(&auth_dir)?;
@@ -58,13 +73,15 @@ fn codex_auth_status_shows_auth_path() -> Result<(), Box<dyn std::error::Error>>
         auth_dir.join("auth.json"),
         r#"{"access":"a","refresh":"r","expires":4102444800000,"accountId":"acct_3"}"#,
     )?;
-    cmd.assert().success().stdout(contains("Auth path:"));
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let out = String::from_utf8(output)?;
+    assert!(out.contains("Storage:"), "{out}");
+    assert!(!out.contains("Auth path:"), "{out}");
     Ok(())
 }
 
 #[test]
-fn codex_auth_status_no_account_id_shows_no_account_line() -> Result<(), Box<dyn std::error::Error>>
-{
+fn codex_auth_status_no_account_id_shows_none() -> Result<(), Box<dyn std::error::Error>> {
     let (mut cmd, temp) = codex_cmd();
     let auth_dir = temp.path().join("codex");
     std::fs::create_dir_all(&auth_dir)?;
@@ -75,7 +92,31 @@ fn codex_auth_status_no_account_id_shows_no_account_line() -> Result<(), Box<dyn
     let output = cmd.output()?;
     let out = String::from_utf8(output.stdout)?;
     assert!(output.status.success());
-    assert!(out.contains("Authenticated: true"));
-    assert!(!out.contains("Account:"));
+    assert!(out.contains("Account: (none)"), "{out}");
+    assert!(!out.contains("Auth path:"), "{out}");
+    assert!(!out.contains("Authenticated: true"), "{out}");
+    Ok(())
+}
+
+#[test]
+fn codex_auth_status_expired_auth_shows_negative_seconds() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut cmd, temp) = codex_cmd();
+    let auth_dir = temp.path().join("codex");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"access":"a","refresh":"r","expires":946684800000,"accountId":"acct_1"}"#,
+    )?;
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let out = String::from_utf8(output)?;
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert!(lines[0].starts_with("Account:"));
+    assert!(
+        lines[1].starts_with("Expires: 2000-01-01T00:00:00.000Z (in -"),
+        "{out}"
+    );
+    assert!(lines[2].starts_with("Storage: "), "{out}");
     Ok(())
 }

@@ -274,11 +274,10 @@ impl CliHandlers for CodexCli {
         let store = file_store();
         let manager = CodexAuthManager::new(store);
         let saved = manager.persist_initial_tokens(&tokens)?;
-        println!("Auth saved in {}", manager.store.auth_path());
-        if let Some(ref aid) = saved.account_id {
-            println!("Account: {aid}");
-        }
-        println!("Authentication complete");
+        print!(
+            "{}",
+            format_auth_saved_output(&manager.store.auth_path(), saved.account_id.as_deref())
+        );
         Ok(())
     }
 
@@ -287,11 +286,10 @@ impl CliHandlers for CodexCli {
         let store = file_store();
         let manager = CodexAuthManager::new(store);
         let saved = manager.persist_initial_tokens(&tokens)?;
-        println!("Auth saved in {}", manager.store.auth_path());
-        if let Some(ref aid) = saved.account_id {
-            println!("Account: {aid}");
-        }
-        println!("Authentication complete");
+        print!(
+            "{}",
+            format_auth_saved_output(&manager.store.auth_path(), saved.account_id.as_deref())
+        );
         Ok(())
     }
 
@@ -300,18 +298,12 @@ impl CliHandlers for CodexCli {
         let stored = store.load_auth()?;
         match stored {
             Some(auth) => {
-                println!("Auth path: {}", store.auth_path());
-                println!("Authenticated: true");
-                if let Some(ref aid) = auth.account_id {
-                    println!("Account: {aid}");
-                }
-                let remaining = auth.expires.saturating_sub(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                ) / 1000;
-                println!("Expires in {remaining}s");
+                println!(
+                    "Account: {}",
+                    auth.account_id.as_deref().unwrap_or("(none)")
+                );
+                println!("{}", format_expiry(auth.expires, now_ms()));
+                println!("Storage: {}", store.auth_path());
                 Ok(())
             }
             None => {
@@ -329,6 +321,40 @@ impl CliHandlers for CodexCli {
 }
 
 pub(crate) static CODEX_CLI: CodexCli = CodexCli;
+
+// ---------------------------------------------------------------------------
+// CLI helpers
+// ---------------------------------------------------------------------------
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn format_expiry(expires: u64, now: u64) -> String {
+    let remaining = (i128::from(expires) - i128::from(now)).div_euclid(1000);
+    let iso = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires) * 1_000_000)
+        .ok()
+        .and_then(|dt| {
+            let fmt = time::format_description::parse_borrowed::<2>(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+            )
+            .ok()?;
+            dt.format(&fmt).ok()
+        })
+        .unwrap_or_else(|| "invalid".to_string());
+    format!("Expires: {iso} (in {remaining}s)")
+}
+
+fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String {
+    let mut out = format!("Auth saved in {auth_path}\n");
+    if let Some(account_id) = account_id {
+        out.push_str(&format!("Account: {account_id}\n"));
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -408,5 +434,40 @@ mod tests {
         // Logout without auth should succeed
         let result = CODEX_CLI.logout();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn format_auth_saved_output_with_account() {
+        assert_eq!(
+            format_auth_saved_output("/tmp/auth.json", Some("acct_1")),
+            "Auth saved in /tmp/auth.json\nAccount: acct_1\n"
+        );
+    }
+
+    #[test]
+    fn format_auth_saved_output_without_account() {
+        assert_eq!(
+            format_auth_saved_output("/tmp/auth.json", None),
+            "Auth saved in /tmp/auth.json\n"
+        );
+    }
+
+    #[test]
+    fn format_expiry_with_future_expiry() {
+        // 2100-01-01T00:00:00Z in ms
+        let expires = 4102444800000;
+        let now = 4102444790000; // 10s before
+        let output = format_expiry(expires, now);
+        assert!(output.starts_with("Expires: 2100-01-01T00:00:00.000Z (in "));
+        assert!(output.ends_with("s)"));
+    }
+
+    #[test]
+    fn format_expiry_with_past_expiry() {
+        // 2000-01-01T00:00:00Z in ms
+        let expires = 946684800000;
+        let now = 946684810000; // 10s after
+        let output = format_expiry(expires, now);
+        assert!(output.starts_with("Expires: 2000-01-01T00:00:00.000Z (in -"));
     }
 }
