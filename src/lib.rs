@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod config;
 pub mod logging;
+pub mod monitor;
 pub mod paths;
 pub mod provider;
 pub mod providers;
@@ -10,6 +11,7 @@ pub mod retry;
 pub mod server;
 pub mod session;
 pub mod traffic;
+pub mod tui;
 
 pub use crate::anthropic::error::{ErrorDetail, ErrorEnvelope, json_error};
 pub use crate::anthropic::schema::MessagesRequest;

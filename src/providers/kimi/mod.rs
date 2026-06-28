@@ -89,6 +89,9 @@ impl Provider for KimiProvider {
 
         // KimiHttpClient uses a blocking client whose lifecycle belongs on a
         // blocking thread.
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.upstream_started(&ctx.req_id);
+        }
         let upstream = match tokio::task::spawn_blocking(move || {
             let client = client::KimiHttpClient::new();
             let result = client.post_kimi(&translated);
@@ -121,6 +124,15 @@ impl Provider for KimiProvider {
                     );
                 }
             };
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.stream_progress(
+                    &ctx.req_id,
+                    sse_bytes.len() as u64,
+                    count_sse_events(&sse_bytes),
+                    None,
+                    None,
+                );
+            }
 
             let headers = [
                 (http::header::CONTENT_TYPE, "text/event-stream"),
@@ -130,7 +142,17 @@ impl Provider for KimiProvider {
             (headers, sse_bytes).into_response()
         } else {
             match accumulate_response(&upstream.body, &message_id, model) {
-                Ok(json) => (StatusCode::OK, Json(json)).into_response(),
+                Ok(json) => {
+                    if let Some(monitor) = ctx.monitor.as_ref() {
+                        monitor.usage_updated(
+                            &ctx.req_id,
+                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                            json.pointer("/usage/output_tokens")
+                                .and_then(|v| v.as_u64()),
+                        );
+                    }
+                    (StatusCode::OK, Json(json)).into_response()
+                }
                 Err(e) => json_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -140,8 +162,11 @@ impl Provider for KimiProvider {
         }
     }
 
-    async fn handle_count_tokens(&self, body: MessagesRequest, _ctx: RequestContext) -> Response {
+    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let tokens = count_tokens::count_tokens(&body);
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.usage_updated(&ctx.req_id, Some(tokens), None);
+        }
         (
             StatusCode::OK,
             Json(CountTokensResponse {
@@ -150,6 +175,10 @@ impl Provider for KimiProvider {
         )
             .into_response()
     }
+}
+
+fn count_sse_events(bytes: &[u8]) -> u64 {
+    String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
 fn map_kimi_error_to_response(err: &client::KimiError) -> Response {

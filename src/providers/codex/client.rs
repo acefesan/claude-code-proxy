@@ -764,6 +764,7 @@ mod tests {
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
+            monitor: None,
         };
         let headers = build_codex_headers(&auth, &ctx).unwrap();
         assert_eq!(
@@ -787,6 +788,7 @@ mod tests {
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
+            monitor: None,
         };
         let headers = build_codex_headers(&auth, &ctx).unwrap();
         assert!(headers.get("session_id").is_none());
@@ -807,6 +809,7 @@ mod tests {
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
+            monitor: None,
         };
         let err = build_codex_headers(&auth, &ctx).unwrap_err();
         assert_eq!(err.status, 500);
@@ -860,6 +863,7 @@ mod tests {
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
+            monitor: None,
         };
         let disabled = super::super::continuation::ContinuationCandidate {
             previous_response_id: None,
@@ -928,6 +932,7 @@ mod tests {
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
+            monitor: None,
         };
         let result = build_codex_headers(&auth, &ctx);
         assert!(

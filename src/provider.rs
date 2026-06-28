@@ -1,4 +1,5 @@
 use crate::anthropic::schema::MessagesRequest;
+use crate::monitor::MonitorHandle;
 use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -37,4 +38,5 @@ pub struct RequestContext {
     pub session_seq: Option<u64>,
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,
+    pub monitor: Option<MonitorHandle>,
 }

@@ -116,6 +116,9 @@ impl Provider for CodexProvider {
 
         // Post to upstream with continuation
         let client = Arc::new(CodexHttpClient::new());
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.upstream_started(&ctx.req_id);
+        }
         let upstream = match client
             .post_codex(&translated, &ctx, Some(&continuation))
             .await
@@ -144,6 +147,15 @@ impl Provider for CodexProvider {
                     );
                 }
             };
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.stream_progress(
+                    &ctx.req_id,
+                    sse_bytes.len() as u64,
+                    count_sse_events(&sse_bytes),
+                    None,
+                    None,
+                );
+            }
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
                 &translated,
@@ -164,6 +176,14 @@ impl Provider for CodexProvider {
                 ctx.traffic.as_deref(),
             ) {
                 Ok(json) => {
+                    if let Some(monitor) = ctx.monitor.as_ref() {
+                        monitor.usage_updated(
+                            &ctx.req_id,
+                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                            json.pointer("/usage/output_tokens")
+                                .and_then(|v| v.as_u64()),
+                        );
+                    }
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
                         &translated,
@@ -183,7 +203,7 @@ impl Provider for CodexProvider {
         }
     }
 
-    async fn handle_count_tokens(&self, body: MessagesRequest, _ctx: RequestContext) -> Response {
+    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.as_deref().unwrap_or("gpt-5.5");
         let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
@@ -215,6 +235,9 @@ impl Provider for CodexProvider {
         };
 
         let tokens = count_translated_tokens(&translated);
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.usage_updated(&ctx.req_id, Some(tokens), None);
+        }
         (
             StatusCode::OK,
             Json(CountTokensResponse {
@@ -223,6 +246,10 @@ impl Provider for CodexProvider {
         )
             .into_response()
     }
+}
+
+fn count_sse_events(bytes: &[u8]) -> u64 {
+    String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
 fn update_continuation_from_upstream(

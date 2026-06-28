@@ -1,10 +1,14 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config, paths,
+    config,
+    monitor::MonitorHandle,
+    paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
+    tui::{self, MonitorUiConfig},
 };
+use std::io::IsTerminal;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -29,6 +33,8 @@ enum Commands {
     Serve {
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long = "no-monitor", action = ArgAction::SetTrue)]
+        no_monitor: bool,
     },
     Models {
         #[arg(long)]
@@ -64,24 +70,58 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let commands = cli.command.unwrap_or(Commands::Serve { port: None });
+    let commands = cli.command.unwrap_or(Commands::Serve {
+        port: None,
+        no_monitor: false,
+    });
 
     match commands {
         Commands::Version => {
             println!("claude-code-proxy {}", VERSION);
             Ok(())
         }
-        Commands::Serve { port } => {
+        Commands::Serve { port, no_monitor } => {
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();
-            print_server_banner(effective_port, &registry);
-            tokio::runtime::Builder::new_multi_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .build()?
-                .block_on(server::serve(ServerConfig {
-                    port: effective_port,
-                }))
-                .map_err(|err| anyhow::anyhow!(err))
+                .build()?;
+            match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
+                ServeMode::Plain => {
+                    print_server_banner(effective_port, &registry);
+                    runtime
+                        .block_on(server::serve(ServerConfig {
+                            port: effective_port,
+                            monitor: None,
+                        }))
+                        .map_err(|err| anyhow::anyhow!(err))
+                }
+                ServeMode::Monitor => {
+                    let monitor = MonitorHandle::default();
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                    let listener = runtime
+                        .block_on(tokio::net::TcpListener::bind(("127.0.0.1", effective_port)))?;
+                    let server_monitor = monitor.clone();
+                    let server_task = runtime.spawn(server::serve_listener(
+                        listener,
+                        Some(server_monitor),
+                        async move {
+                            let _ = shutdown_rx.await;
+                        },
+                    ));
+                    let ui_result = tui::run_monitor(
+                        monitor,
+                        MonitorUiConfig {
+                            port: effective_port,
+                            registry: &registry,
+                            shutdown: Some(shutdown_tx),
+                        },
+                    );
+                    let server_result = runtime.block_on(server_task)?;
+                    ui_result?;
+                    server_result.map_err(|err| anyhow::anyhow!(err))
+                }
+            }
         }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
@@ -90,6 +130,20 @@ fn main() -> Result<()> {
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeMode {
+    Monitor,
+    Plain,
+}
+
+fn select_serve_mode(stdout_is_tty: bool, no_monitor: bool) -> ServeMode {
+    if stdout_is_tty && !no_monitor {
+        ServeMode::Monitor
+    } else {
+        ServeMode::Plain
     }
 }
 
@@ -190,4 +244,24 @@ fn print_server_banner(port: u16, registry: &Registry) {
 #[allow(dead_code)]
 fn alias_names() -> usize {
     ANTHROPIC_STYLE_ALIASES.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_serve_selects_monitor_on_tty() {
+        assert_eq!(select_serve_mode(true, false), ServeMode::Monitor);
+    }
+
+    #[test]
+    fn no_monitor_selects_plain_mode() {
+        assert_eq!(select_serve_mode(true, true), ServeMode::Plain);
+    }
+
+    #[test]
+    fn non_tty_stdout_selects_plain_mode() {
+        assert_eq!(select_serve_mode(false, false), ServeMode::Plain);
+    }
 }

@@ -1,6 +1,7 @@
 use crate::{
     anthropic::json_error,
     logging::{Logger, REDACT_KEYS, create_logger},
+    monitor::{EndpointKind, MonitorHandle},
     provider::RequestContext,
     registry::{Registry, normalize_incoming_model},
     session::{self, SessionState},
@@ -16,6 +17,7 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -23,14 +25,38 @@ use uuid::Uuid;
 
 pub struct ServerConfig {
     pub port: u16,
+    pub monitor: Option<MonitorHandle>,
 }
 
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
+    serve_inner(config, std::future::pending::<()>()).await
+}
+
+pub async fn serve_with_shutdown(
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    serve_inner(config, shutdown).await
+}
+
+async fn serve_inner(
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await?;
+    serve_listener(listener, config.monitor, shutdown).await
+}
+
+pub async fn serve_listener(
+    listener: TcpListener,
+    monitor: Option<MonitorHandle>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let port = listener.local_addr()?.port();
     create_logger("server").info(
         "server listening",
         Some(serde_json::Map::from_iter([
-            ("port".to_string(), json!(config.port)),
+            ("port".to_string(), json!(port)),
             (
                 "logDir".to_string(),
                 json!(
@@ -41,37 +67,47 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             ),
         ])),
     );
-    let app = app(Arc::new(Registry::with_default_alias()));
-    axum::serve(listener, app).await?;
+    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
+    app_with_monitor(registry, None)
+}
+
+pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
+    let state = Arc::new(AppState { registry, monitor });
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .fallback(fallback_handler)
-        .with_state(registry)
+        .with_state(state)
+}
+
+#[derive(Clone)]
+struct AppState {
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn handler_messages(State(registry): State<Arc<Registry>>, req: Request<Body>) -> Response {
-    dispatch_request(registry, req, false).await
+async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    dispatch_request(state, req, false).await
 }
 
-async fn handler_count_tokens(
-    State(registry): State<Arc<Registry>>,
-    req: Request<Body>,
-) -> Response {
-    dispatch_request(registry, req, true).await
+async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    dispatch_request(state, req, true).await
 }
 
 async fn dispatch_request(
-    registry: Arc<Registry>,
+    state: Arc<AppState>,
     req: Request<Body>,
     count_tokens: bool,
 ) -> Response {
@@ -83,6 +119,11 @@ async fn dispatch_request(
     let headers = req.headers().clone();
     let path = uri.path().to_string();
     let query = redacted_query(&uri);
+    let endpoint = if count_tokens {
+        EndpointKind::CountTokens
+    } else {
+        EndpointKind::Messages
+    };
     log.info(
         "request",
         Some(serde_json::Map::from_iter([
@@ -97,6 +138,9 @@ async fn dispatch_request(
         .get("x-claude-code-session-id")
         .and_then(|value| value.to_str().ok())
         .map(std::string::ToString::to_string);
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.request_started(&req_id, session_id.clone(), None, endpoint);
+    }
     let now = current_millis();
     let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
@@ -117,6 +161,12 @@ async fn dispatch_request(
                     started_at,
                 },
             );
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(response.status()),
+                format!("Invalid JSON: {err}"),
+            );
             return response;
         }
     };
@@ -124,6 +174,7 @@ async fn dispatch_request(
     let body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
         Ok(body) => body,
         Err(response) => {
+            let status = response.status();
             log_request_completed(
                 &log,
                 RequestLogContext {
@@ -134,6 +185,12 @@ async fn dispatch_request(
                     status: response.status(),
                     started_at,
                 },
+            );
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(status),
+                "Invalid JSON",
             );
             return *response;
         }
@@ -147,7 +204,7 @@ async fn dispatch_request(
                 "invalid_request_error",
                 format!(
                     "Missing \"model\" in request body. {}",
-                    registry.unknown_model_message()
+                    state.registry.unknown_model_message()
                 ),
             );
             log_request_completed(
@@ -161,6 +218,12 @@ async fn dispatch_request(
                     started_at,
                 },
             );
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(response.status()),
+                "Missing model",
+            );
             return response;
         }
     };
@@ -172,7 +235,7 @@ async fn dispatch_request(
         None
     };
 
-    let provider = registry.provider_for_model(
+    let provider = state.registry.provider_for_model(
         &normalized_model,
         session_state
             .as_ref()
@@ -194,7 +257,7 @@ async fn dispatch_request(
                 "invalid_request_error",
                 format!(
                     "Unknown model \"{normalized_model}\". {}",
-                    registry.unknown_model_message()
+                    state.registry.unknown_model_message()
                 ),
             );
             log_request_completed(
@@ -208,6 +271,12 @@ async fn dispatch_request(
                     started_at,
                 },
             );
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(response.status()),
+                format!("Unknown model \"{normalized_model}\""),
+            );
             return response;
         }
     };
@@ -219,6 +288,12 @@ async fn dispatch_request(
         &normalized_model,
         now,
     );
+    if let Some(monitor) = state.monitor.as_ref() {
+        if let Some(current) = current.as_ref() {
+            monitor.request_started(&req_id, session_id.clone(), Some(current.seq), endpoint);
+        }
+        monitor.provider_selected(&req_id, provider.name(), &normalized_model);
+    }
 
     let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
@@ -230,6 +305,9 @@ async fn dispatch_request(
     .map(Arc::new);
 
     if let Some(capture) = traffic.as_ref() {
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.traffic_capture_path(&req_id, capture.root().to_path_buf());
+        }
         capture.write_json(
             "000-metadata",
             &json!({
@@ -257,6 +335,7 @@ async fn dispatch_request(
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
         traffic,
+        monitor: state.monitor.clone(),
     };
 
     let response = if count_tokens {
@@ -275,6 +354,18 @@ async fn dispatch_request(
             started_at,
         },
     );
+    if response.status().is_success() {
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.request_completed(&req_id, response.status().as_u16(), None, None);
+        }
+    } else {
+        monitor_failed(
+            state.monitor.as_ref(),
+            &req_id,
+            Some(response.status()),
+            format!("HTTP {}", response.status().as_u16()),
+        );
+    }
     response
 }
 
@@ -302,6 +393,17 @@ fn log_request_completed(log: &Logger, ctx: RequestLogContext<'_>) {
             ),
         ])),
     );
+}
+
+fn monitor_failed(
+    monitor: Option<&MonitorHandle>,
+    req_id: &str,
+    status: Option<StatusCode>,
+    error: impl Into<String>,
+) {
+    if let Some(monitor) = monitor {
+        monitor.request_failed(req_id, status.map(|status| status.as_u16()), error);
+    }
 }
 
 fn headers_to_record(headers: &http::HeaderMap) -> Value {

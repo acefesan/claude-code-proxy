@@ -61,6 +61,10 @@ pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapt
 }
 
 impl TrafficCapture {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn write_json(&self, name: &str, value: &Value) {
         let value = redact_traffic(value);
         let payload = serde_json::to_string_pretty(&value)

@@ -80,6 +80,15 @@ impl Provider for CursorProvider {
                 if let Some(result) = find_tool_result(&body, pending.tool_use_id()) {
                     let (_result_messages, sse_bytes) =
                         resume_cursor_tool_bridge(session_id, &message_id, model, result, &pending);
+                    if let Some(monitor) = ctx.monitor.as_ref() {
+                        monitor.stream_progress(
+                            &ctx.req_id,
+                            sse_bytes.len() as u64,
+                            count_sse_events(&sse_bytes),
+                            None,
+                            None,
+                        );
+                    }
                     let headers = [
                         (http::header::CONTENT_TYPE, "text/event-stream"),
                         (http::header::CACHE_CONTROL, "no-cache"),
@@ -105,6 +114,9 @@ impl Provider for CursorProvider {
         let images = request::cursor_selected_images(&body);
 
         let client = CursorHttpClient::new();
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.upstream_started(&ctx.req_id);
+        }
         let upstream = match client.run_agent(&token, &prompt, &model, &images).await {
             Ok(r) => r,
             Err(e) => {
@@ -137,6 +149,15 @@ impl Provider for CursorProvider {
                     allowed,
                     Box::new(|| uuid::Uuid::new_v4().to_string().replace('-', "")),
                 );
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.stream_progress(
+                        &ctx.req_id,
+                        sse_bytes.len() as u64,
+                        count_sse_events(&sse_bytes),
+                        None,
+                        None,
+                    );
+                }
 
                 let headers = [
                     (http::header::CONTENT_TYPE, "text/event-stream"),
@@ -146,6 +167,15 @@ impl Provider for CursorProvider {
                 (headers, sse_bytes).into_response()
             } else {
                 let sse_bytes = sse::frame_cursor_stream(&upstream, &message_id, model);
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.stream_progress(
+                        &ctx.req_id,
+                        sse_bytes.len() as u64,
+                        count_sse_events(&sse_bytes),
+                        None,
+                        None,
+                    );
+                }
                 let headers = [
                     (http::header::CONTENT_TYPE, "text/event-stream"),
                     (http::header::CACHE_CONTROL, "no-cache"),
@@ -155,7 +185,17 @@ impl Provider for CursorProvider {
             }
         } else {
             match decode_cursor_upstream(&upstream, &message_id, model) {
-                Ok(json) => (StatusCode::OK, Json(json)).into_response(),
+                Ok(json) => {
+                    if let Some(monitor) = ctx.monitor.as_ref() {
+                        monitor.usage_updated(
+                            &ctx.req_id,
+                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                            json.pointer("/usage/output_tokens")
+                                .and_then(|v| v.as_u64()),
+                        );
+                    }
+                    (StatusCode::OK, Json(json)).into_response()
+                }
                 Err(e) => json_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -165,9 +205,12 @@ impl Provider for CursorProvider {
         }
     }
 
-    async fn handle_count_tokens(&self, body: MessagesRequest, _ctx: RequestContext) -> Response {
+    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let prompt = render_cursor_prompt(&body);
         let tokens = (prompt.len() / 4) as u64; // rough estimate
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.usage_updated(&ctx.req_id, Some(tokens), None);
+        }
         (
             StatusCode::OK,
             Json(CountTokensResponse {
@@ -176,6 +219,10 @@ impl Provider for CursorProvider {
         )
             .into_response()
     }
+}
+
+fn count_sse_events(bytes: &[u8]) -> u64 {
+    String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
 // ---------------------------------------------------------------------------
