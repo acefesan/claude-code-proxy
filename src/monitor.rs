@@ -569,7 +569,7 @@ fn session_summaries(
         }
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
-        entry.last_seen = request.finished_at;
+        entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
         entry.input_tokens = entry
             .input_tokens
             .saturating_add(request.input_tokens.unwrap_or(0));
@@ -600,7 +600,7 @@ fn session_summaries(
         entry.request_count += 1;
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
-        entry.last_seen = SystemTime::now();
+        entry.last_seen = max_system_time(entry.last_seen, request.started_at);
         entry.input_tokens = entry
             .input_tokens
             .saturating_add(request.input_tokens.unwrap_or(0));
@@ -612,9 +612,29 @@ fn session_summaries(
     }
 
     let mut out: Vec<_> = sessions.into_values().collect();
-    out.sort_by_key(|session| session.last_seen);
-    out.reverse();
+    out.sort_by(|left, right| {
+        session_sort_key(right)
+            .cmp(&session_sort_key(left))
+            .then_with(|| left.label().cmp(&right.label()))
+    });
     out
+}
+
+fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
+    if right.duration_since(left).is_ok() {
+        right
+    } else {
+        left
+    }
+}
+
+fn session_sort_key(session: &SessionSummary) -> (u128, usize, usize) {
+    let last_seen = session
+        .last_seen
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    (last_seen, session.active_count, session.request_count)
 }
 
 pub fn throughput(
@@ -782,5 +802,38 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(state.sessions[0].request_count, 2);
         assert_eq!(state.sessions[0].active_count, 1);
         assert_eq!(state.sessions[0].output_tokens, 20);
+    }
+
+    #[test]
+    fn active_session_order_is_stable_between_snapshots() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some("session-a".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.request_started(
+            "r2",
+            Some("session-b".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+
+        let first: Vec<_> = monitor
+            .snapshot()
+            .sessions
+            .iter()
+            .map(SessionSummary::label)
+            .collect();
+        std::thread::sleep(Duration::from_millis(2));
+        let second: Vec<_> = monitor
+            .snapshot()
+            .sessions
+            .iter()
+            .map(SessionSummary::label)
+            .collect();
+
+        assert_eq!(first, second);
     }
 }
