@@ -58,6 +58,6 @@ run *ARGS:
 _release bump *ARGS:
     @cargo-release {{bump}} {{ARGS}}
 
-# Release the current package version
+# Release a new patch version
 release *ARGS:
-    @just _release current {{ARGS}}
+    @just _release patch {{ARGS}}
