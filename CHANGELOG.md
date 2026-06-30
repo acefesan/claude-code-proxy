@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.1.0 (2026-06-28)
+## v0.1.0 (2026-06-30)
 
 - Ships the native Rust implementation as the release binary and removes the
   copied TypeScript reference source from the branch.
@@ -12,6 +12,9 @@
   links them from `request_failed` log events for copyable diagnostics.
 - Adds stable session ordering, visible token throughput, and clearer request
   error details in the monitor.
+- Resolves Codex model aliases before building upstream requests, so
+  Claude-style aliases such as `claude-sonnet-4-6` are sent as supported Codex
+  model names.
 - Add end-to-end smoke coverage for Kimi chat-completions, Codex HTTP
   Responses, and Codex WebSocket Responses through in-process mock upstreams
   with isolated auth.
