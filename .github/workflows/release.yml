@@ -30,7 +30,7 @@ jobs:
             platform: darwin-arm64
             ext: ""
             archive: tar.gz
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             platform: darwin-amd64
             ext: ""
