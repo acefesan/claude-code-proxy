@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Codex WebSocket continuations recover from streams that only deliver rate
+  limit or control events, preventing Claude Code sessions from waiting
+  indefinitely on a stalled upstream response.
+
 ## v0.1.1 (2026-06-30)
 
 - Codex reasoning summaries are now surfaced as thinking blocks in the response
