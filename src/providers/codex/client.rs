@@ -948,6 +948,7 @@ mod tests {
         ];
         let req = ResponsesRequest {
             model: "gpt-5.5".to_string(),
+            max_output_tokens: 32_000,
             instructions: None,
             input,
             tools: None,
@@ -969,6 +970,7 @@ mod tests {
             payload.get("type").and_then(|v| v.as_str()),
             Some("response.create")
         );
+        assert_eq!(payload["max_output_tokens"], 32_000);
         assert!(payload.get("stream").is_none());
         assert!(payload.get("previous_response_id").is_none());
     }

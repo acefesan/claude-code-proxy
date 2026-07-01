@@ -229,6 +229,7 @@ mod tests {
         }];
         let req = ResponsesRequest {
             model: "gpt-5.5".to_string(),
+            max_output_tokens: 32_000,
             instructions: None,
             input,
             tools: None,

@@ -756,6 +756,7 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     });
     assert_eq!(sent["type"], "response.create");
     assert_eq!(sent["model"], "gpt-5.5");
+    assert_eq!(sent["max_output_tokens"], 64);
     assert!(sent.get("stream").is_none());
 }
 
