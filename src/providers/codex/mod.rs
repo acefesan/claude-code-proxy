@@ -125,8 +125,9 @@ impl Provider for CodexProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         if want_stream && matches!(config::codex_transport(), config::CodexTransport::WebSocket) {
+            let stream_request = translated.clone();
             let upstream_events = match client
-                .stream_codex_websocket_events(&translated, &ctx, None)
+                .stream_codex_websocket_events(&translated, &ctx, Some(&continuation))
                 .await
             {
                 Ok(events) => events,
@@ -135,7 +136,8 @@ impl Provider for CodexProvider {
                     return map_codex_error_to_response(&e);
                 }
             };
-            return live_stream_response(upstream_events, message_id, model, ctx).await;
+            return live_stream_response(upstream_events, message_id, model, ctx, stream_request)
+                .await;
         }
 
         let upstream = match client
@@ -278,8 +280,10 @@ async fn live_stream_response(
     message_id: String,
     model: &str,
     ctx: RequestContext,
+    request_body: translate::request::ResponsesRequest,
 ) -> Response {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
+    let mut upstream_sse_body = Vec::new();
 
     while let Some(item) = upstream_events.recv().await {
         let payload = match item {
@@ -289,6 +293,7 @@ async fn live_stream_response(
                 return map_codex_error_to_response(&err);
             }
         };
+        append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
         {
             Ok(result) => result,
@@ -300,13 +305,28 @@ async fn live_stream_response(
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
             if terminal {
-                clear_continuation(ctx.session_id.as_deref());
+                update_continuation_from_upstream(
+                    ctx.session_id.as_deref(),
+                    &request_body,
+                    &upstream_sse_body,
+                );
                 return single_live_stream_response(chunk);
             }
-            return remaining_live_stream_response(upstream_events, translator, chunk, ctx);
+            return remaining_live_stream_response(
+                upstream_events,
+                translator,
+                chunk,
+                ctx,
+                request_body,
+                upstream_sse_body,
+            );
         }
         if terminal {
-            clear_continuation(ctx.session_id.as_deref());
+            update_continuation_from_upstream(
+                ctx.session_id.as_deref(),
+                &request_body,
+                &upstream_sse_body,
+            );
             return empty_live_stream_response();
         }
     }
@@ -356,15 +376,19 @@ fn remaining_live_stream_response(
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
     ctx: RequestContext,
+    request_body: translate::request::ResponsesRequest,
+    mut upstream_sse_body: Vec<u8>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
+            clear_continuation(ctx.session_id.as_deref());
             return;
         }
         while let Some(item) = upstream_events.recv().await {
             match item {
                 Ok(payload) => {
+                    append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) =
                         match translate_live_stream_payload(&mut translator, &payload, &ctx) {
                             Ok(result) => result,
@@ -377,11 +401,16 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                            clear_continuation(ctx.session_id.as_deref());
                             return;
                         }
                     }
                     if terminal {
-                        clear_continuation(ctx.session_id.as_deref());
+                        update_continuation_from_upstream(
+                            ctx.session_id.as_deref(),
+                            &request_body,
+                            &upstream_sse_body,
+                        );
                         return;
                     }
                 }
@@ -405,6 +434,16 @@ fn remaining_live_stream_response(
         rx.recv().await.map(|item| (item, rx))
     });
     event_stream_response(stream)
+}
+
+fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
+    let text = payload.to_string();
+    for line in text.lines() {
+        buffer.extend_from_slice(b"data: ");
+        buffer.extend_from_slice(line.as_bytes());
+        buffer.push(b'\n');
+    }
+    buffer.push(b'\n');
 }
 
 fn event_stream_response<S>(stream: S) -> Response

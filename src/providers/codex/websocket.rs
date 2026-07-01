@@ -86,7 +86,7 @@ impl std::fmt::Display for CodexWebSocketError {
 // ---------------------------------------------------------------------------
 
 struct PoolEntry {
-    ws: AsyncMutex<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    ws: Arc<AsyncMutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
     created_at: u64,
 }
 
@@ -370,7 +370,7 @@ pub async fn codex_websocket_request(
 
     // New connection path (not pooled or pool miss)
     let entry = Arc::new(PoolEntry {
-        ws: AsyncMutex::new(ws_stream),
+        ws: Arc::new(AsyncMutex::new(ws_stream)),
         created_at: now_ms(),
     });
 
@@ -475,32 +475,81 @@ pub async fn codex_websocket_event_stream(
                 },
             }),
         );
-        write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, false);
     }
 
-    let (mut ws_stream, _) = connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?;
-    ws_stream
-        .send(Message::Text(body_json))
-        .await
-        .map_err(|e| CodexError {
-            status: 0,
-            message: format!("WebSocket send error: {e}"),
-            detail: None,
-            retry_after: None,
-            origin: CodexErrorOrigin::WebSocket,
-        })?;
+    let pooled = pool_key.and_then(|key| {
+        let guard = WS_POOL.lock().ok()?;
+        guard.get(key).cloned()
+    });
+    let used_pooled = pooled.is_some();
+    let entry = if let Some(entry) = pooled {
+        entry
+    } else {
+        let (ws_stream, _) = connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?;
+        Arc::new(PoolEntry {
+            ws: Arc::new(AsyncMutex::new(ws_stream)),
+            created_at: now_ms(),
+        })
+    };
+
+    if let Some(tc) = traffic.as_deref() {
+        write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, used_pooled);
+    }
 
     let (tx, rx) = mpsc::channel(64);
     let pool_key = pool_key.map(str::to_string);
+    let ws = entry.ws.clone();
     tokio::spawn(async move {
-        stream_ws_events(
-            &mut ws_stream,
+        let mut ws_guard = ws.lock_owned().await;
+        if used_pooled && ws_guard.send(Message::Ping(vec![])).await.is_err() {
+            if let Some(key) = pool_key.as_deref() {
+                invalidate_codex_websocket_pool_key(key);
+            }
+            let _ = tx
+                .send(Err(CodexError {
+                    status: 0,
+                    message: "WebSocket send error: failed to ping pooled connection".to_string(),
+                    detail: None,
+                    retry_after: None,
+                    origin: CodexErrorOrigin::WebSocket,
+                }))
+                .await;
+            return;
+        }
+        if let Err(e) = ws_guard.send(Message::Text(body_json)).await {
+            if let Some(key) = pool_key.as_deref() {
+                invalidate_codex_websocket_pool_key(key);
+            }
+            let _ = tx
+                .send(Err(CodexError {
+                    status: 0,
+                    message: format!("WebSocket send error: {e}"),
+                    detail: None,
+                    retry_after: None,
+                    origin: CodexErrorOrigin::WebSocket,
+                }))
+                .await;
+            return;
+        }
+
+        let reusable = stream_ws_events(
+            &mut ws_guard,
             idle_timeout_ms,
             pool_key.as_deref(),
             traffic,
             tx,
         )
         .await;
+
+        if let Some(key) = pool_key.as_deref() {
+            if reusable {
+                if !used_pooled {
+                    pool_insert(key.to_string(), entry.clone());
+                }
+            } else {
+                invalidate_codex_websocket_pool_key(key);
+            }
+        }
     });
     Ok(rx)
 }
@@ -853,7 +902,7 @@ async fn stream_ws_events(
     pool_key: Option<&str>,
     traffic: Option<Arc<TrafficCapture>>,
     tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
-) {
+) -> bool {
     let started_at = Instant::now();
     let mut sse_body: Vec<u8> = Vec::new();
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
@@ -861,6 +910,7 @@ async fn stream_ws_events(
     let mut last_response_event_at = response_wait_started;
     let mut response_started = false;
     let mut status = 200u16;
+    let mut reusable = false;
 
     loop {
         let response_deadline_started = if response_started {
@@ -946,10 +996,34 @@ async fn stream_ws_events(
                     status = extract_status_from_error(&parsed).unwrap_or(500);
                 }
                 let terminal = is_terminal_event(&parsed);
+                if terminal && is_previous_response_missing(&parsed) {
+                    if let Some(key) = pool_key {
+                        invalidate_codex_websocket_pool_key(key);
+                    }
+                    let _ = tx
+                        .send(Err(CodexError {
+                            status: 0,
+                            message: "Previous response not found".to_string(),
+                            detail: Some("previous_response_not_found".to_string()),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        }))
+                        .await;
+                    break;
+                }
+                let event_type = parsed
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 if tx.send(Ok(parsed)).await.is_err() {
+                    if let Some(key) = pool_key {
+                        invalidate_codex_websocket_pool_key(key);
+                    }
                     break;
                 }
                 if terminal {
+                    reusable = event_type == "response.completed";
                     break;
                 }
             }
@@ -1000,6 +1074,7 @@ async fn stream_ws_events(
     if let Some(tc) = traffic.as_deref() {
         write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
     }
+    reusable
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
@@ -1160,7 +1235,7 @@ mod tests {
             guard.insert(
                 "test-session".to_string(),
                 Arc::new(PoolEntry {
-                    ws: AsyncMutex::new(create_dummy_stream()),
+                    ws: Arc::new(AsyncMutex::new(create_dummy_stream())),
                     created_at: now_ms(),
                 }),
             );
@@ -1213,7 +1288,7 @@ mod tests {
             guard.insert(
                 "binary-session".to_string(),
                 Arc::new(PoolEntry {
-                    ws: AsyncMutex::new(pooled_stream),
+                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
                     created_at: now_ms(),
                 }),
             );
@@ -1248,7 +1323,7 @@ mod tests {
             guard.insert(
                 "start-timeout-session".to_string(),
                 Arc::new(PoolEntry {
-                    ws: AsyncMutex::new(pooled_stream),
+                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
                     created_at: now_ms(),
                 }),
             );
@@ -1301,7 +1376,7 @@ mod tests {
             guard.insert(
                 "response-idle-session".to_string(),
                 Arc::new(PoolEntry {
-                    ws: AsyncMutex::new(pooled_stream),
+                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
                     created_at: now_ms(),
                 }),
             );

@@ -497,7 +497,7 @@ impl CodexHttpClient {
         let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
         let ws_body = build_websocket_request(body, continuation);
 
-        super::websocket::codex_websocket_event_stream(
+        let first_stream = super::websocket::codex_websocket_event_stream(
             &self.base_url,
             &ws_headers,
             &ws_body,
@@ -508,7 +508,66 @@ impl CodexHttpClient {
             super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
             continuation,
         )
-        .await
+        .await?;
+
+        let can_retry_without_continuation = continuation
+            .and_then(|c| c.previous_response_id.as_deref())
+            .is_some();
+        if !can_retry_without_continuation {
+            return Ok(first_stream);
+        }
+
+        let retry_body = build_websocket_request(body, None);
+        let base_url = self.base_url.clone();
+        let ctx = ctx.clone();
+        let pool_key = pool_key.map(str::to_string);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let mut stream = first_stream;
+            let mut retry_available = true;
+            loop {
+                match stream.recv().await {
+                    Some(Err(err)) if retry_available && is_continuation_retry_error(&err) => {
+                        retry_available = false;
+                        super::continuation::clear_continuation(ctx.session_id.as_deref());
+                        if let Some(key) = pool_key.as_deref() {
+                            super::websocket::invalidate_codex_websocket_pool_key(key);
+                        }
+                        match super::websocket::codex_websocket_event_stream(
+                            &base_url,
+                            &ws_headers,
+                            &retry_body,
+                            &ctx,
+                            ctx.traffic.clone(),
+                            pool_key.as_deref(),
+                            super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
+                            super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(retry_stream) => {
+                                stream = retry_stream;
+                                continue;
+                            }
+                            Err(retry_err) => {
+                                let _ = tx.send(Err(retry_err)).await;
+                                return;
+                            }
+                        }
+                    }
+                    Some(item) => {
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     async fn attempt_post_http(
@@ -759,6 +818,10 @@ fn should_retry_without_continuation(
         return false;
     }
 
+    is_continuation_retry_error(err)
+}
+
+fn is_continuation_retry_error(err: &CodexError) -> bool {
     matches!(
         err.detail.as_deref(),
         Some("previous_response_not_found")
