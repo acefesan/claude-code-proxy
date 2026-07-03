@@ -421,6 +421,8 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 .get("input_schema")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            let description = codex_tool_description(&name, description);
+            let parameters = codex_tool_parameters(&name, parameters);
             out.push(ResponsesTool::Function(ResponsesFunctionTool {
                 kind: "function".to_string(),
                 name,
@@ -434,6 +436,56 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     } else {
         Ok(Some(out))
     }
+}
+
+fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
+    if name != "Read" {
+        return description;
+    }
+
+    let base = description.unwrap_or_else(|| "Reads a file from the local filesystem.".to_string());
+    Some(format!(
+        "{base}\n\nCodex guidance:\n\
+         - `offset` is a zero based line index in the displayed Read output.\n\
+         - The first displayed line has offset 0.\n\
+         - To continue reading, use previous offset plus returned line count.\n\
+         - Omit `offset` and `limit` unless continuing a large file.\n\
+         - Use shell tools for grep style line numbers when exact slices matter."
+    ))
+}
+
+fn codex_tool_parameters(name: &str, mut parameters: Value) -> Value {
+    if name != "Read" {
+        return parameters;
+    }
+
+    let Some(props) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return parameters;
+    };
+
+    if let Some(offset) = props.get_mut("offset").and_then(Value::as_object_mut) {
+        offset.insert(
+            "description".to_string(),
+            Value::String(
+                "Zero based line index to start reading from. The first displayed line is 0. Use previous offset plus returned line count when continuing a prior Read.".to_string(),
+            ),
+        );
+    }
+
+    if let Some(limit) = props.get_mut("limit").and_then(Value::as_object_mut) {
+        limit.insert(
+            "description".to_string(),
+            Value::String(
+                "Number of lines to read. Omit unless the file is too large to read in one request."
+                    .to_string(),
+            ),
+        );
+    }
+
+    parameters
 }
 
 fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>, anyhow::Error> {
@@ -694,6 +746,93 @@ mod tests {
             out.tool_choice,
             Some(ResponsesToolChoice::WebSearch { .. })
         ));
+    }
+
+    #[test]
+    fn translate_read_tool_adds_codex_offset_guidance() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"read it"}],
+            "tools": [{
+                "name": "Read",
+                "description": "Reads a file from the local filesystem.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "integer", "description": "old offset"},
+                        "limit": {"type": "integer", "description": "old limit"}
+                    },
+                    "required": ["file_path"]
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let description = tool.description.as_deref().unwrap();
+        assert!(description.contains("Codex guidance"));
+        assert!(description.contains("zero based line index"));
+
+        let props = tool
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            props
+                .get("offset")
+                .and_then(|v| v.get("description"))
+                .and_then(Value::as_str),
+            Some(
+                "Zero based line index to start reading from. The first displayed line is 0. Use previous offset plus returned line count when continuing a prior Read."
+            )
+        );
+        assert_eq!(
+            props
+                .get("limit")
+                .and_then(|v| v.get("description"))
+                .and_then(Value::as_str),
+            Some(
+                "Number of lines to read. Omit unless the file is too large to read in one request."
+            )
+        );
+    }
+
+    #[test]
+    fn translate_non_read_tool_preserves_tool_metadata() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"search"}],
+            "tools": [{
+                "name": "Search",
+                "description": "Find matching records.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "offset": {"type": "integer", "description": "record offset"}
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        assert_eq!(tool.description.as_deref(), Some("Find matching records."));
+        assert_eq!(
+            tool.parameters
+                .get("properties")
+                .and_then(|v| v.get("offset"))
+                .and_then(|v| v.get("description"))
+                .and_then(Value::as_str),
+            Some("record offset")
+        );
     }
 
     #[test]
