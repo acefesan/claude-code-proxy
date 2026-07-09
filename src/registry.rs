@@ -39,6 +39,9 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];

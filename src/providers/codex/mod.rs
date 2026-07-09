@@ -84,7 +84,7 @@ impl Provider for CodexProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("gpt-5.5");
+        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
 
         let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
@@ -228,7 +228,7 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let model = body.model.as_deref().unwrap_or("gpt-5.5");
+        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
         let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
@@ -966,8 +966,10 @@ mod tests {
     fn supported_models_includes_fast_variants() {
         let provider = CodexProvider::new();
         let models = provider.supported_models();
-        assert!(models.contains(&"gpt-5.5".to_string()));
-        assert!(models.contains(&"gpt-5.5-fast".to_string()));
+        assert!(models.contains(&"gpt-5.6-sol".to_string()));
+        assert!(models.contains(&"gpt-5.6-sol-fast".to_string()));
+        assert!(models.contains(&"gpt-5.6-terra".to_string()));
+        assert!(models.contains(&"gpt-5.6-luna".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
     }

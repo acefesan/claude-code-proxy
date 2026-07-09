@@ -110,7 +110,7 @@ requests, and error events. Use `--no-monitor` for plain terminal output.
 
 `ANTHROPIC_MODEL` selects the provider:
 
-- `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
+- `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
 - `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
@@ -127,9 +127,9 @@ would 400 because no provider claims it, so set
 # Codex
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.5[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini[1m] \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
+ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -166,9 +166,9 @@ Or set it persistently in `~/.claude/settings.json`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
     "ANTHROPIC_AUTH_TOKEN": "unused",
-    "ANTHROPIC_MODEL": "gpt-5.5[1m]",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini[1m]",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 272000,
+    "ANTHROPIC_MODEL": "gpt-5.6-sol[1m]",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-luna[1m]",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 372000,
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
   }
@@ -183,13 +183,13 @@ is a local Claude Code hint that raises that compaction threshold. It is useful
 only when the upstream model can actually handle a window that large.
 
 Use the `[1m]` suffix for Codex and Kimi models so Claude Code uses a larger
-local compaction threshold, such as `gpt-5.5[1m]`, `gpt-5.4-mini[1m]`, or
+local compaction threshold, such as `gpt-5.6-sol[1m]`, `gpt-5.6-luna[1m]`, or
 `kimi-for-coding[1m]`. The proxy strips a trailing `[1m]` before sending the
 request upstream. The suffix affects Claude Code's local compaction decision and
 does not increase the upstream model's context window.
 
-Official Codex metadata reports `gpt-5.5` with a 272K-token window, not a 1M
-window. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.5[1m]` so
+Official Codex metadata reports the GPT-5.6 Codex models with a 372K-token
+window. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000` with `gpt-5.6-sol[1m]` so
 Claude Code does not compact too early, while still compacting before the real
 upstream limit.
 
@@ -216,9 +216,9 @@ the default.
 if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
     export ANTHROPIC_BASE_URL="http://localhost:18765"
     export ANTHROPIC_AUTH_TOKEN="unused"
-    export ANTHROPIC_MODEL="gpt-5.5[1m]"
-    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini[1m]"
-    export CLAUDE_CODE_AUTO_COMPACT_WINDOW="272000"
+    export ANTHROPIC_MODEL="gpt-5.6-sol[1m]"
+    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.6-luna[1m]"
+    export CLAUDE_CODE_AUTO_COMPACT_WINDOW="372000"
     export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
     export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1"
 fi
@@ -260,8 +260,8 @@ Upstream: `https://chatgpt.com/backend-api/codex/responses` (Responses API).
 
 Set `ANTHROPIC_MODEL` to a model your ChatGPT subscription is allowed to use.
 Append `-fast` to a Codex model name to request Codex fast mode for that request
-without restarting the proxy. For example, `gpt-5.5-fast` is sent upstream as
-model `gpt-5.5` with `service_tier: "priority"`. An explicit
+without restarting the proxy. For example, `gpt-5.6-sol-fast` is sent upstream as
+model `gpt-5.6-sol` with `service_tier: "priority"`. An explicit
 `codex.serviceTier` / `CCP_CODEX_SERVICE_TIER` override still takes precedence.
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
@@ -383,11 +383,11 @@ recorded back into the session map when Cursor returns it.
 
 Auth:
 
-| Command              | What it does                                                        |
-| -------------------- | ------------------------------------------------------------------- |
-| `cursor auth login`  | Browser login and proxy-owned Cursor token storage                  |
-| `cursor auth status` | Shows proxy-owned Cursor credential source and token expiry         |
-| `cursor auth logout` | Clears proxy-owned Cursor credentials                               |
+| Command              | What it does                                                |
+| -------------------- | ----------------------------------------------------------- |
+| `cursor auth login`  | Browser login and proxy-owned Cursor token storage          |
+| `cursor auth status` | Shows proxy-owned Cursor credential source and token expiry |
+| `cursor auth logout` | Clears proxy-owned Cursor credentials                       |
 
 ## How it works
 
@@ -417,12 +417,12 @@ sequenceDiagram
 
 ## Commands
 
-| Command                                             | Description               |
-| --------------------------------------------------- | ------------------------- |
+| Command                                             | Description                 |
+| --------------------------------------------------- | --------------------------- |
 | [`serve`](#serve)                                   | Start the proxy and monitor |
-| `codex auth login` / `device` / `status` / `logout` | Codex OAuth management    |
-| `kimi  auth login` / `status` / `logout`            | Kimi OAuth management     |
-| `cursor auth login` / `status` / `logout`           | Cursor OAuth management   |
+| `codex auth login` / `device` / `status` / `logout` | Codex OAuth management      |
+| `kimi  auth login` / `status` / `logout`            | Kimi OAuth management       |
+| `cursor auth login` / `status` / `logout`           | Cursor OAuth management     |
 
 ---
 
@@ -642,33 +642,33 @@ Windows, and at
 }
 ```
 
-| Variable                         | Config key                 | Default                                           | Purpose                                                                                                                          |
-| -------------------------------- | -------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                           | `port`                     | `18765`                                           | Proxy listen port                                                                                                                |
-| `CCP_CONFIG_DIR`                 | unset                      | platform config dir                               | Per-process config directory; Cursor auth uses it for file storage                                                               |
-| `XDG_STATE_HOME`                 | —                          | `~/.local/state`                                  | Linux/macOS base dir for `proxy.log`                                                                                             |
-| `CCP_LOG_STDERR`                 | `log.stderr`               | unset                                             | Also mirror log lines to stderr; any env value enables it                                                                        |
-| `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                             |
-| `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                           |
-| `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                  |
-| `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                      |
-| `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                     |
-| `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`) |
-| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`)                                     |
-| `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                          |
-| `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                 |
-| `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                            |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                  |
-| `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                        |
-| `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                   |
-| `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                   |
-| `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                                    |
-| `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                   |
-| `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                           |
-| `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                         |
-| `CCP_CURSOR_AUTH_TOKEN`          | —                          | unset                                             | Use this Cursor bearer token instead of local claude-code-proxy Cursor auth storage                                               |
-| `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                              |
-| `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT` and `CCP_KIMI_USER_AGENT`                                                                    |
+| Variable                         | Config key                 | Default                                           | Purpose                                                                                                                                                                           |
+| -------------------------------- | -------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                           | `port`                     | `18765`                                           | Proxy listen port                                                                                                                                                                 |
+| `CCP_CONFIG_DIR`                 | unset                      | platform config dir                               | Per-process config directory; Cursor auth uses it for file storage                                                                                                                |
+| `XDG_STATE_HOME`                 | —                          | `~/.local/state`                                  | Linux/macOS base dir for `proxy.log`                                                                                                                                              |
+| `CCP_LOG_STDERR`                 | `log.stderr`               | unset                                             | Also mirror log lines to stderr; any env value enables it                                                                                                                         |
+| `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                                                                              |
+| `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                                                                            |
+| `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
+| `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
+| `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
+| `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-iterra`) |
+| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`)                                                                                      |
+| `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
+| `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
+| `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
+| `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                                                                         |
+| `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
+| `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
+| `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                                                                                     |
+| `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                                                                    |
+| `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                                                                            |
+| `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                                                                          |
+| `CCP_CURSOR_AUTH_TOKEN`          | —                          | unset                                             | Use this Cursor bearer token instead of local claude-code-proxy Cursor auth storage                                                                                               |
+| `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                                                                               |
+| `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT` and `CCP_KIMI_USER_AGENT`                                                                                                                     |
 
 A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
@@ -708,7 +708,7 @@ sticky sessions or shared state before enabling continuation.
   account headers are redacted, but prompt and tool content are intentionally
   preserved for debugging.
   For the most complete debugging run, use `CCP_LOG_STDERR=1 CCP_LOG_VERBOSE=1
-  CCP_TRAFFIC_LOG=1`.
+CCP_TRAFFIC_LOG=1`.
 - `config.json` — optional configuration file (see table above). It lives at
   `~/.config/claude-code-proxy/config.json` on macOS,
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux,

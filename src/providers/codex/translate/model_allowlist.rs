@@ -11,6 +11,9 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -129,16 +132,24 @@ mod tests {
     }
 
     #[test]
-    fn fast_suffix_adds_priority() {
-        let r = resolve_model_request("gpt-5.5-fast");
+    fn opus_resolves_to_gpt5_5() {
+        let r = resolve_model_request("opus");
         assert_eq!(r.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn fast_suffix_adds_priority() {
+        let r = resolve_model_request("gpt-5.6-sol-fast");
+        assert_eq!(r.model, "gpt-5.6-sol");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
     }
 
     #[test]
     fn allowed_models_accept_base() {
         assert!(assert_allowed_model("gpt-5.4").is_ok());
-        assert!(assert_allowed_model("gpt-5.5").is_ok());
+        assert!(assert_allowed_model("gpt-5.6-sol").is_ok());
+        assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
+        assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
     }
 
     #[test]
