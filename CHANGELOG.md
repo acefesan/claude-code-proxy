@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.9 (2026-07-10)
+
+- Claude model aliases use the matching GPT-5.6 tier through Codex: Haiku uses
+  Luna, Sonnet uses Terra, and Opus uses Sol.
+- GPT-5.6 Codex requests preserve reasoning context and support system guidance
+  and tools through the Responses Lite API.
+- The dashboard shows requested effort and resolved upstream models, making
+  routing decisions easier to inspect.
+
 ## v0.1.8 (2026-07-09)
 
 - Codex requests can use `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`,
