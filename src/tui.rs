@@ -280,8 +280,17 @@ fn text_cell(value: impl Into<String>) -> Cell<'static> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
 }
 
-fn model_cell(value: Option<&str>) -> Cell<'static> {
-    text_cell(ellipsize(value.unwrap_or("-"), 16))
+fn model_cell(value: Option<&str>, width: usize) -> Cell<'static> {
+    text_cell(ellipsize(value.unwrap_or("-"), width))
+}
+
+fn table_column_width(area: Rect, widths: &[Constraint], column: usize) -> usize {
+    let table_width = area.width.saturating_sub(2);
+    Layout::horizontal(widths.to_vec())
+        .spacing(1)
+        .split(Rect::new(0, 0, table_width, 1))
+        .get(column)
+        .map_or(0, |rect| usize::from(rect.width))
 }
 
 fn ellipsize(value: &str, width: usize) -> String {
@@ -404,6 +413,21 @@ fn render_sessions(
     sessions: &[SessionSummary],
     selected: usize,
 ) {
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(36),
+        Constraint::Length(6),
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(10),
+        Constraint::Percentage(20),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(12),
+        Constraint::Length(10),
+    ];
+    let model_width = table_column_width(area, &widths, 6);
     let rows = sessions.iter().enumerate().map(|(index, session)| {
         let marker = if index == selected { ">" } else { " " };
         Row::new(vec![
@@ -413,7 +437,7 @@ fn render_sessions(
             number_cell(session.request_count.to_string()),
             number_cell(session.failure_count.to_string()),
             provider_cell(session.provider.as_deref()),
-            model_cell(session.model.as_deref()),
+            model_cell(session.model.as_deref(), model_width),
             text_cell(session.effort.as_deref().unwrap_or("-")),
             number_cell(compact_tokens(session.input_tokens)),
             number_cell(compact_tokens(session.output_tokens)),
@@ -426,38 +450,22 @@ fn render_sessions(
             Style::default().bg(PANEL_BG)
         })
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(1),
-            Constraint::Length(36),
-            Constraint::Length(6),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(10),
-            Constraint::Percentage(20),
-            Constraint::Length(7),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(12),
-            Constraint::Length(10),
-        ],
-    )
-    .header(table_header_aligned([
-        ("", Alignment::Left),
-        ("session", Alignment::Left),
-        ("active", Alignment::Right),
-        ("reqs", Alignment::Right),
-        ("fail", Alignment::Right),
-        ("provider", Alignment::Left),
-        ("model", Alignment::Left),
-        ("effort", Alignment::Left),
-        ("in", Alignment::Right),
-        ("out", Alignment::Right),
-        ("rate", Alignment::Right),
-        ("status", Alignment::Left),
-    ]))
-    .block(panel("Sessions", true));
+    let table = Table::new(rows, widths)
+        .header(table_header_aligned([
+            ("", Alignment::Left),
+            ("session", Alignment::Left),
+            ("active", Alignment::Right),
+            ("reqs", Alignment::Right),
+            ("fail", Alignment::Right),
+            ("provider", Alignment::Left),
+            ("model", Alignment::Left),
+            ("effort", Alignment::Left),
+            ("in", Alignment::Right),
+            ("out", Alignment::Right),
+            ("rate", Alignment::Right),
+            ("status", Alignment::Left),
+        ]))
+        .block(panel("Sessions", true));
     frame.render_widget(table, area);
 }
 
@@ -467,6 +475,17 @@ fn render_active(
     active: &[ActiveRequest],
     tick: usize,
 ) {
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Min(18),
+        Constraint::Length(7),
+        Constraint::Length(12),
+        Constraint::Length(13),
+        Constraint::Length(12),
+        Constraint::Length(9),
+    ];
+    let model_width = table_column_width(area, &widths, 2);
     let rows = active.iter().map(|request| {
         let status = if matches!(
             request.status.label(),
@@ -479,7 +498,7 @@ fn render_active(
         Row::new(vec![
             muted_cell(format_system_time(request.started_at)),
             provider_cell(request.provider.as_deref()),
-            model_cell(request.model.as_deref()),
+            model_cell(request.model.as_deref(), model_width),
             text_cell(request.effort.as_deref().unwrap_or("-")),
             muted_cell(request.endpoint.label()),
             Cell::from(Span::styled(status, status_style(request.status.label()))),
@@ -488,34 +507,35 @@ fn render_active(
         ])
         .style(Style::default().bg(PANEL_BG))
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Min(18),
-            Constraint::Length(7),
-            Constraint::Length(12),
-            Constraint::Length(13),
-            Constraint::Length(12),
-            Constraint::Length(9),
-        ],
-    )
-    .header(table_header_aligned([
-        ("started", Alignment::Left),
-        ("provider", Alignment::Left),
-        ("model", Alignment::Left),
-        ("effort", Alignment::Left),
-        ("endpoint", Alignment::Left),
-        ("status", Alignment::Left),
-        ("rate", Alignment::Left),
-        ("elapsed", Alignment::Right),
-    ]))
-    .block(panel("Active requests", false));
+    let table = Table::new(rows, widths)
+        .header(table_header_aligned([
+            ("started", Alignment::Left),
+            ("provider", Alignment::Left),
+            ("model", Alignment::Left),
+            ("effort", Alignment::Left),
+            ("endpoint", Alignment::Left),
+            ("status", Alignment::Left),
+            ("rate", Alignment::Left),
+            ("elapsed", Alignment::Right),
+        ]))
+        .block(panel("Active requests", false));
     frame.render_widget(table, area);
 }
 
 fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Min(16),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Percentage(28),
+    ];
+    let model_width = table_column_width(area, &widths, 3);
     let rows = recent.iter().map(|request| {
         Row::new(vec![
             muted_cell(format_system_time(request.finished_at)),
@@ -527,7 +547,7 @@ fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                 http_status_style(request.http_status),
             )),
             provider_cell(request.provider.as_deref()),
-            model_cell(request.model.as_deref()),
+            model_cell(request.model.as_deref(), model_width),
             text_cell(request.effort.as_deref().unwrap_or("-")),
             number_cell(format_duration(request.latency)),
             rate_cell(request.rate().label()),
@@ -537,38 +557,32 @@ fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
         ])
         .style(Style::default().bg(PANEL_BG))
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(10),
-            Constraint::Min(16),
-            Constraint::Length(7),
-            Constraint::Length(9),
-            Constraint::Length(12),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Percentage(28),
-        ],
-    )
-    .header(table_header_aligned([
-        ("finished", Alignment::Left),
-        ("status", Alignment::Left),
-        ("provider", Alignment::Left),
-        ("model", Alignment::Left),
-        ("effort", Alignment::Left),
-        ("latency", Alignment::Right),
-        ("rate", Alignment::Right),
-        ("in", Alignment::Right),
-        ("out", Alignment::Right),
-        ("details", Alignment::Left),
-    ]))
-    .block(panel("Recent requests", false));
+    let table = Table::new(rows, widths)
+        .header(table_header_aligned([
+            ("finished", Alignment::Left),
+            ("status", Alignment::Left),
+            ("provider", Alignment::Left),
+            ("model", Alignment::Left),
+            ("effort", Alignment::Left),
+            ("latency", Alignment::Right),
+            ("rate", Alignment::Right),
+            ("in", Alignment::Right),
+            ("out", Alignment::Right),
+            ("details", Alignment::Left),
+        ]))
+        .block(panel("Recent requests", false));
     frame.render_widget(table, area);
 }
 
 fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Min(18),
+        Constraint::Percentage(50),
+    ];
+    let model_width = table_column_width(area, &widths, 3);
     let rows = recent
         .iter()
         .filter(|request| {
@@ -591,29 +605,20 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                 muted_cell(format_system_time(request.finished_at)),
                 Cell::from(Span::styled(status, http_status_style(request.http_status))),
                 provider_cell(request.provider.as_deref()),
-                model_cell(request.model.as_deref()),
+                model_cell(request.model.as_deref(), model_width),
                 detail_cell(message),
             ])
             .style(Style::default().bg(PANEL_BG))
         });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(10),
-            Constraint::Min(18),
-            Constraint::Percentage(50),
-        ],
-    )
-    .header(table_header_aligned([
-        ("time", Alignment::Left),
-        ("status", Alignment::Left),
-        ("provider", Alignment::Left),
-        ("model", Alignment::Left),
-        ("message", Alignment::Left),
-    ]))
-    .block(panel("Events", false));
+    let table = Table::new(rows, widths)
+        .header(table_header_aligned([
+            ("time", Alignment::Left),
+            ("status", Alignment::Left),
+            ("provider", Alignment::Left),
+            ("model", Alignment::Left),
+            ("message", Alignment::Left),
+        ]))
+        .block(panel("Events", false));
     frame.render_widget(table, area);
 }
 
@@ -851,6 +856,25 @@ fn format_system_time(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_column_width_tracks_terminal_width() {
+        let widths = [
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(18),
+            Constraint::Length(7),
+            Constraint::Length(12),
+            Constraint::Length(13),
+            Constraint::Length(12),
+            Constraint::Length(9),
+        ];
+        let narrow = table_column_width(Rect::new(0, 0, 110, 10), &widths, 2);
+        let wide = table_column_width(Rect::new(0, 0, 212, 10), &widths, 2);
+
+        assert!(wide > narrow);
+        assert!(wide >= "claude-haiku-4-5 → gpt-5.6-luna".chars().count());
+    }
 
     #[test]
     fn ellipsize_marks_truncated_values() {
