@@ -1,8 +1,16 @@
 # Changelog
 
+## v0.1.11 (2026-07-11)
+
+- Grok subscriptions can power Claude Code through browser login, with support for
+  Grok 4.5 and Composer 2.5 Fast, streaming, thinking, tools, and token counts.
+- Codex WebSocket requests recover from handshake failures and stay marked active
+  until the full response body finishes streaming.
+- The monitor shows local timestamps, clearer request status and detail indicators,
+  more compact columns, arrow-key pane navigation, and an uncluttered display.
 - Forward Claude Code's `max` effort as Codex `reasoning.effort: "max"` so
   GPT-5.6 can use its highest supported reasoning level instead of silently
-  receiving `xhigh`.
+  receiving `xhigh`. ([#28](https://github.com/raine/claude-code-proxy/pull/28))
 
 ## v0.1.10 (2026-07-10)
 
