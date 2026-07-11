@@ -149,26 +149,16 @@ pub fn run_monitor(
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
                     KeyCode::Tab => app.focus = app.focus.next(),
-                    KeyCode::Down | KeyCode::Char('j') => match app.focus {
-                        FocusPane::Sessions => {
-                            app.selected = app
-                                .selected
-                                .saturating_add(1)
-                                .min(state.sessions.len().saturating_sub(1))
-                        }
-                        FocusPane::Recent => {
-                            app.recent_selected = app
-                                .recent_selected
-                                .saturating_add(1)
-                                .min(state.recent.len().saturating_sub(1))
-                        }
-                    },
-                    KeyCode::Up | KeyCode::Char('k') => match app.focus {
-                        FocusPane::Sessions => app.selected = app.selected.saturating_sub(1),
-                        FocusPane::Recent => {
-                            app.recent_selected = app.recent_selected.saturating_sub(1)
-                        }
-                    },
+                    KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
+                    KeyCode::Char('j') => {
+                        app.move_down(state.sessions.len(), state.recent.len(), false)
+                    }
+                    KeyCode::Up => app.move_up(state.sessions.len(), state.recent.len(), true),
+                    KeyCode::Char('k') => {
+                        app.move_up(state.sessions.len(), state.recent.len(), false)
+                    }
+                    KeyCode::Right => app.focus = FocusPane::Recent,
+                    KeyCode::Left => app.focus = FocusPane::Sessions,
                     KeyCode::Enter => {
                         app.detail = match app.focus {
                             FocusPane::Sessions if !state.sessions.is_empty() => {
@@ -200,7 +190,7 @@ pub fn run_monitor(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusPane {
     Sessions,
     Recent,
@@ -238,6 +228,45 @@ impl MonitorApp {
     fn clamp_selection(&mut self, sessions: usize, recent: usize) {
         self.selected = self.selected.min(sessions.saturating_sub(1));
         self.recent_selected = self.recent_selected.min(recent.saturating_sub(1));
+    }
+
+    fn move_down(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
+        match self.focus {
+            FocusPane::Sessions => {
+                if switch_panes && self.selected >= sessions.saturating_sub(1) && recent > 0 {
+                    self.focus = FocusPane::Recent;
+                    self.recent_selected = 0;
+                } else {
+                    self.selected = self
+                        .selected
+                        .saturating_add(1)
+                        .min(sessions.saturating_sub(1));
+                }
+            }
+            FocusPane::Recent => {
+                self.recent_selected = self
+                    .recent_selected
+                    .saturating_add(1)
+                    .min(recent.saturating_sub(1));
+            }
+        }
+    }
+
+    fn move_up(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
+        match self.focus {
+            FocusPane::Sessions => self.selected = self.selected.saturating_sub(1),
+            FocusPane::Recent => {
+                if switch_panes && self.recent_selected == 0 && sessions > 0 {
+                    self.focus = FocusPane::Sessions;
+                    self.selected = sessions.saturating_sub(1);
+                } else {
+                    self.recent_selected = self
+                        .recent_selected
+                        .saturating_sub(1)
+                        .min(recent.saturating_sub(1));
+                }
+            }
+        }
     }
 }
 
@@ -993,8 +1022,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" setup  ", Style::default().fg(DIM)),
-        Span::styled("j/k", Style::default().fg(TEAL)),
-        Span::styled(" select  ", Style::default().fg(DIM)),
+        Span::styled("arrows/j/k", Style::default().fg(TEAL)),
+        Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
         Span::styled(" pane  ", Style::default().fg(DIM)),
         Span::styled("Enter", Style::default().fg(TEAL)),
@@ -1028,8 +1057,8 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("q / Ctrl-C", "quit proxy"),
         ("?", "toggle help"),
         ("b", "toggle setup"),
-        ("j / Down", "next row"),
-        ("k / Up", "previous row"),
+        ("arrows", "navigate rows and panes"),
+        ("j / k", "previous / next row"),
         ("Tab", "switch pane"),
         ("Enter", "open detail"),
         ("Esc", "close overlay / detail"),
@@ -1533,6 +1562,55 @@ mod tests {
 
         app.clamp_selection(0, 0);
         assert_eq!(app.selected, 0);
+        assert_eq!(app.recent_selected, 0);
+    }
+
+    #[test]
+    fn arrow_navigation_moves_between_focus_panes_at_edges() {
+        let mut app = MonitorApp {
+            port: 3000,
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 1,
+            recent_selected: 0,
+            tick: 0,
+            shutdown: None,
+        };
+
+        app.move_down(2, 3, true);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected, 0);
+
+        app.move_up(2, 3, true);
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn vim_navigation_stays_within_focused_pane() {
+        let mut app = MonitorApp {
+            port: 3000,
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 1,
+            recent_selected: 0,
+            tick: 0,
+            shutdown: None,
+        };
+
+        app.move_down(2, 3, false);
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.selected, 1);
+
+        app.focus = FocusPane::Recent;
+        app.move_up(2, 3, false);
+        assert_eq!(app.focus, FocusPane::Recent);
         assert_eq!(app.recent_selected, 0);
     }
 }
