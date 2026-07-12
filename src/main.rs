@@ -114,10 +114,20 @@ fn main() -> Result<()> {
                 claude_code_proxy::dashboard::bind_dashboard_listener(dashboard_port),
             )?;
             let dashboard_registry = Arc::clone(&registry);
+            let routing = claude_code_proxy::routing::RoutingCoordinator::load(
+                paths::state_dir().join("routing-state.json"),
+                15_000,
+            )?;
             let dashboard_task = runtime.spawn(claude_code_proxy::dashboard::serve_listener(
                 dashboard_listener,
                 dashboard_registry,
-                claude_code_proxy::scanner::ScanConfig::host(),
+                claude_code_proxy::dashboard::DashboardConfig {
+                    scan: claude_code_proxy::scanner::ScanConfig::host(),
+                    routing,
+                    admin_secret: std::env::var("CCP_ADMIN_SECRET").ok(),
+                    allowed_origin: std::env::var("CCP_DASHBOARD_ORIGIN")
+                        .unwrap_or_else(|_| format!("http://127.0.0.1:{dashboard_port}")),
+                },
                 std::future::pending::<()>(),
             ));
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
