@@ -9,6 +9,7 @@ pub mod provider;
 pub mod providers;
 pub mod registry;
 pub mod retry;
+pub mod routing;
 pub mod server;
 pub mod session;
 pub mod traffic;
