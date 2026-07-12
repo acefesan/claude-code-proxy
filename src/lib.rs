@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod anthropic_passthrough;
 pub mod auth;
 pub mod config;
 pub mod dashboard;

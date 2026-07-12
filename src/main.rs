@@ -118,6 +118,7 @@ fn main() -> Result<()> {
                 paths::state_dir().join("routing-state.json"),
                 15_000,
             )?;
+            let proxy_routing = routing.clone();
             let dashboard_task = runtime.spawn(claude_code_proxy::dashboard::serve_listener(
                 dashboard_listener,
                 dashboard_registry,
@@ -135,9 +136,13 @@ fn main() -> Result<()> {
                     print_server_banner(effective_port, registry.as_ref());
                     println!("Dashboard: http://127.0.0.1:{dashboard_port}");
                     runtime
-                        .block_on(server::serve_listener(
+                        .block_on(server::serve_listener_managed(
                             proxy_listener,
                             None,
+                            server::ManagedRouting {
+                                coordinator: proxy_routing,
+                                anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
+                            },
                             std::future::pending::<()>(),
                         ))
                         .map_err(|err| anyhow::anyhow!(err))?;
@@ -149,9 +154,13 @@ fn main() -> Result<()> {
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let server_monitor = monitor.clone();
-                    let server_task = runtime.spawn(server::serve_listener(
+                    let server_task = runtime.spawn(server::serve_listener_managed(
                         proxy_listener,
                         Some(server_monitor),
+                        server::ManagedRouting {
+                            coordinator: proxy_routing,
+                            anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
+                        },
                         async move {
                             let _ = shutdown_rx.await;
                         },

@@ -1,6 +1,8 @@
 use crate::{
     registry::Registry,
-    routing::{RouteProvider, RouteTarget, RoutingCoordinator, RoutingError, SessionRoute},
+    routing::{
+        RouteProvider, RouteStatus, RouteTarget, RoutingCoordinator, RoutingError, SessionRoute,
+    },
     scanner::{ObservedRoute, ScanConfig, ScanResult, scan_sessions},
 };
 use axum::{
@@ -54,7 +56,38 @@ struct ChangeRouteRequest {
 struct SessionView {
     #[serde(flatten)]
     observed: crate::scanner::ScannedSession,
-    routing: Option<SessionRoute>,
+    routing: Option<RouteView>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteView {
+    desired: RouteTarget,
+    effective: RouteTarget,
+    revision: u64,
+    pending_since_ms: Option<u64>,
+    transitioned_at_ms: u64,
+    last_error: Option<String>,
+    active_requests: usize,
+    host_idle: bool,
+    host_observed_at_ms: Option<u64>,
+    status: RouteStatus,
+}
+
+impl From<SessionRoute> for RouteView {
+    fn from(route: SessionRoute) -> Self {
+        Self {
+            status: route.status(),
+            desired: route.desired,
+            effective: route.effective,
+            revision: route.revision,
+            pending_since_ms: route.pending_since_ms,
+            transitioned_at_ms: route.transitioned_at_ms,
+            last_error: route.last_error,
+            active_requests: route.active_requests,
+            host_idle: route.host_idle,
+            host_observed_at_ms: route.host_observed_at_ms,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -159,11 +192,13 @@ fn enrich_sessions(
         let routing = if let Some(session_id) = observed.session_id.as_deref() {
             let initial = initial_target(&observed.route);
             state.config.routing.ensure_session(session_id, initial)?;
-            Some(state.config.routing.observe_host(
-                session_id,
-                observed.status == "idle",
-                result.scanned_at_ms,
-            )?)
+            Some(
+                state
+                    .config
+                    .routing
+                    .observe_host(session_id, observed.status == "idle", result.scanned_at_ms)?
+                    .into(),
+            )
         } else {
             None
         };
@@ -221,7 +256,7 @@ async fn change_route(
         },
         body.expected_revision,
     ) {
-        Ok(route) => Json(route).into_response(),
+        Ok(route) => Json(RouteView::from(route)).into_response(),
         Err(RoutingError::StaleRevision { .. }) => error(StatusCode::CONFLICT, "stale_revision"),
         Err(RoutingError::UnknownSession(_)) => error(StatusCode::NOT_FOUND, "unknown_session"),
         Err(other) => error(StatusCode::BAD_REQUEST, &other.to_string()),

@@ -1,12 +1,18 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use claude_code_proxy::{
+    anthropic_passthrough::AnthropicPassthrough,
     monitor::{MonitorHandle, RequestStatus},
     registry::Registry,
-    server::{app, app_with_monitor, bind_proxy_listener},
+    routing::{RouteProvider, RouteTarget, RoutingCoordinator},
+    server::{
+        ManagedRouting, app, app_with_managed_routing, app_with_monitor, bind_proxy_listener,
+    },
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
+use tempfile::TempDir;
+use tokio::net::TcpListener;
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
@@ -22,6 +28,73 @@ async fn bind_error_names_address_and_port() {
 
     assert!(err.contains(&format!("127.0.0.1:{port}")));
     assert!(err.contains("failed to bind proxy listener"));
+}
+
+#[tokio::test]
+async fn managed_anthropic_route_preserves_request_and_releases_after_body() {
+    async fn upstream(headers: axum::http::HeaderMap, body: axum::body::Bytes) -> &'static str {
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer private");
+        assert_eq!(
+            body,
+            axum::body::Bytes::from_static(b"{ \"model\": \"claude-fable-5\" }")
+        );
+        "native-response"
+    }
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(
+            upstream_listener,
+            axum::Router::new().route("/v1/messages", axum::routing::post(upstream)),
+        )
+        .await
+        .unwrap();
+    });
+    let temp = TempDir::new().unwrap();
+    let routing = RoutingCoordinator::load(temp.path().join("routing.json"), 10_000).unwrap();
+    routing
+        .ensure_session(
+            "native-session",
+            RouteTarget {
+                provider: RouteProvider::Anthropic,
+                model: "claude-fable-5".to_owned(),
+            },
+        )
+        .unwrap();
+    let app = app_with_managed_routing(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        ManagedRouting {
+            coordinator: routing.clone(),
+            anthropic: AnthropicPassthrough::with_origin(format!("http://{upstream_address}"))
+                .unwrap(),
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("x-claude-code-session-id", "native-session")
+                .header("authorization", "Bearer private")
+                .body(Body::from("{ \"model\": \"claude-fable-5\" }"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        routing.session("native-session").unwrap().active_requests,
+        1
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body, axum::body::Bytes::from_static(b"native-response"));
+    assert_eq!(
+        routing.session("native-session").unwrap().active_requests,
+        0
+    );
+    upstream_task.abort();
 }
 
 #[tokio::test]

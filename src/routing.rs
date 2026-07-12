@@ -37,11 +37,11 @@ pub struct SessionRoute {
     pub pending_since_ms: Option<u64>,
     pub transitioned_at_ms: u64,
     pub last_error: Option<String>,
-    #[serde(skip)]
+    #[serde(skip_serializing, default)]
     pub active_requests: usize,
-    #[serde(skip)]
+    #[serde(skip_serializing, default)]
     pub host_idle: bool,
-    #[serde(skip)]
+    #[serde(skip_serializing, default)]
     pub host_observed_at_ms: Option<u64>,
 }
 

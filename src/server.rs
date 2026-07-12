@@ -1,9 +1,11 @@
 use crate::{
     anthropic::json_error,
+    anthropic_passthrough::AnthropicPassthrough,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     provider::RequestContext,
     registry::{Registry, normalize_incoming_model},
+    routing::{RequestAdmission, RouteProvider, RoutingCoordinator},
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -85,12 +87,54 @@ pub async fn serve_listener(
     Ok(())
 }
 
+pub struct ManagedRouting {
+    pub coordinator: RoutingCoordinator,
+    pub anthropic: AnthropicPassthrough,
+}
+
+pub async fn serve_listener_managed(
+    listener: TcpListener,
+    monitor: Option<MonitorHandle>,
+    routing: ManagedRouting,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let app = app_with_state(
+        Arc::new(Registry::with_default_alias()),
+        monitor,
+        Some(Arc::new(routing)),
+    );
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
 pub fn app(registry: Arc<Registry>) -> Router {
     app_with_monitor(registry, None)
 }
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
-    let state = Arc::new(AppState { registry, monitor });
+    app_with_state(registry, monitor, None)
+}
+
+pub fn app_with_managed_routing(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    routing: ManagedRouting,
+) -> Router {
+    app_with_state(registry, monitor, Some(Arc::new(routing)))
+}
+
+fn app_with_state(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    routing: Option<Arc<ManagedRouting>>,
+) -> Router {
+    let state = Arc::new(AppState {
+        registry,
+        monitor,
+        routing,
+    });
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handler_messages))
@@ -103,6 +147,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
 struct AppState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
+    routing: Option<Arc<ManagedRouting>>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -149,10 +194,60 @@ async fn dispatch_request(
         .get("x-claude-code-session-id")
         .and_then(|value| value.to_str().ok())
         .map(std::string::ToString::to_string);
+    let routing_admission = state
+        .routing
+        .as_ref()
+        .zip(session_id.as_deref())
+        .and_then(|(routing, session_id)| routing.coordinator.admit(session_id).ok());
+    if routing_admission
+        .as_ref()
+        .is_some_and(|admission| admission.target().provider == RouteProvider::Anthropic)
+    {
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.request_started(&req_id, session_id.clone(), None, endpoint);
+            monitor.provider_selected(
+                &req_id,
+                "anthropic",
+                &routing_admission
+                    .as_ref()
+                    .expect("checked admission")
+                    .target()
+                    .model,
+                None,
+            );
+        }
+        let guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone())
+            .with_routing(routing_admission);
+        return match state
+            .routing
+            .as_ref()
+            .expect("managed admission requires routing")
+            .anthropic
+            .forward(req)
+            .await
+        {
+            Ok(response) => monitor_response_body(response, guard),
+            Err(error) => {
+                monitor_failed(
+                    state.monitor.as_ref(),
+                    &req_id,
+                    Some(StatusCode::BAD_GATEWAY),
+                    "native Anthropic request failed",
+                );
+                drop(guard);
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    format!("Native Anthropic request failed: {error}"),
+                )
+            }
+        };
+    }
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, endpoint);
     }
-    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone())
+        .with_routing(routing_admission);
     let now = current_millis();
     let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
@@ -285,7 +380,11 @@ async fn dispatch_request(
         }
     };
 
-    let normalized_model = normalize_incoming_model(model);
+    let normalized_model = request_guard
+        .routing_target()
+        .filter(|target| target.provider == RouteProvider::Codex)
+        .map(|target| target.model.clone())
+        .unwrap_or_else(|| normalize_incoming_model(model));
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
     } else {
@@ -680,11 +779,25 @@ fn redact_error_key(value: Value) -> Value {
 struct RequestMonitorGuard {
     monitor: Option<MonitorHandle>,
     req_id: String,
+    routing: Option<RequestAdmission>,
 }
 
 impl RequestMonitorGuard {
     fn new(monitor: Option<MonitorHandle>, req_id: String) -> Self {
-        Self { monitor, req_id }
+        Self {
+            monitor,
+            req_id,
+            routing: None,
+        }
+    }
+
+    fn with_routing(mut self, routing: Option<RequestAdmission>) -> Self {
+        self.routing = routing;
+        self
+    }
+
+    fn routing_target(&self) -> Option<&crate::routing::RouteTarget> {
+        self.routing.as_ref().map(RequestAdmission::target)
     }
 
     fn completed(&mut self, status: StatusCode) {
