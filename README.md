@@ -1,11 +1,8 @@
 # claude-code-proxy
 
-`claude-code-proxy` lets you use
-[Claude Code](https://www.anthropic.com/claude-code) with your **ChatGPT
-Plus/Pro** subscription, your **Kimi Code** (kimi.com) account, or **Cursor
-Agent**.
+Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, or **Cursor**.
 
-<img src="meta/claude-code-screenshot.webp" alt="Claude Code running through claude-code-proxy" width="630" />
+<img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
 [Quick start](#quick-start) · [Providers](#providers) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
@@ -46,7 +43,7 @@ artifacts are published as `claude-code-proxy-windows-amd64.zip` and
 
 ### 2. Pick a provider and authenticate
 
-The proxy supports three upstream providers. Pick one and run its login flow; the
+The proxy supports four upstream providers. Pick one and run its login flow; the
 proxy will refuse to start traffic until a token is stored.
 
 **Codex (ChatGPT Plus/Pro):**
@@ -67,6 +64,19 @@ claude-code-proxy kimi auth login      # device-code flow (prints URL + code)
 
 Sign in with your **kimi.com account**. The verification URL is displayed; open
 it in any browser, confirm the code, and the CLI polls until done.
+
+**Grok (grok.com):**
+
+```sh
+claude-code-proxy grok auth login      # browser OAuth (PKCE)
+# or, on a headless machine:
+claude-code-proxy grok auth device     # device-code flow (prints URL + code)
+```
+
+Sign in with your **grok.com account**. The proxy stores and refreshes its own
+OAuth session and does not use the official Grok CLI credential file. On a
+headless host, `grok auth device` prints a verification URL and code to enter on
+any other device, then polls until authorization completes.
 
 **Cursor Agent:**
 
@@ -90,6 +100,7 @@ Verify:
 ```sh
 claude-code-proxy codex auth status
 claude-code-proxy kimi auth status
+claude-code-proxy grok auth status
 claude-code-proxy cursor auth status
 ```
 
@@ -112,6 +123,7 @@ requests, and error events. Use `--no-monitor` for plain terminal output.
 
 - `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
+- `grok-composer-2.5-fast`, `grok-4.5` → **grok**
 - `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
 An unknown model returns a 400 listing the supported ids. There is no
@@ -142,6 +154,15 @@ ANTHROPIC_SMALL_FAST_MODEL=kimi-for-coding[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
+
+# Grok
+ANTHROPIC_BASE_URL=http://localhost:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=grok-composer-2.5-fast \
+ANTHROPIC_SMALL_FAST_MODEL=grok-composer-2.5-fast \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  claude --model grok-composer-2.5-fast
 
 # Cursor Agent
 ANTHROPIC_BASE_URL=http://localhost:18765 \
@@ -258,6 +279,12 @@ the change immediately; existing sessions keep whatever they started with.
 
 Upstream: `https://chatgpt.com/backend-api/codex/responses` (Responses API).
 
+OpenAI's Thibault Sottiaux has publicly welcomed using Codex through other coding
+harnesses:
+
+> [Share the recipe. People want to know how to use GPT-5.6 Sol in CC. We don't
+> discriminate on the harness.](https://x.com/thsottiaux/status/2075830097488249060)
+
 Set `ANTHROPIC_MODEL` to a model your ChatGPT subscription is allowed to use.
 Append `-fast` to a Codex model name to request Codex fast mode for that request
 without restarting the proxy. For example, `gpt-5.6-sol-fast` is sent upstream as
@@ -266,9 +293,8 @@ model `gpt-5.6-sol` with `service_tier: "priority"`. An explicit
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
 the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`low`
-/ `medium` / `high` / `xhigh`). Claude Code's `max` value is sent upstream as
-`xhigh`. An explicit `codex.effort` / `CCP_CODEX_EFFORT` override still takes
-precedence and can also force `none`.
+/ `medium` / `high` / `xhigh` / `max`). An explicit `codex.effort` /
+`CCP_CODEX_EFFORT` override still takes precedence and can also force `none`.
 
 Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
 Codex for `reasoning.summary: "auto"` and translates returned summary deltas
@@ -330,6 +356,31 @@ Auth:
 | `kimi auth login`  | Device-code OAuth via `auth.kimi.com` |
 | `kimi auth status` | Show user ID + token expiry           |
 | `kimi auth logout` | Delete stored credentials             |
+
+### Grok
+
+Upstream: `https://cli-chat-proxy.grok.com/v1/responses` (Responses API).
+
+Supported model ids are `grok-composer-2.5-fast` and `grok-4.5`. Model access
+can vary by account and region. The proxy translates Claude Code messages,
+function tools, tool results, thinking, token counts, and streaming events.
+Grok reasoning text appears in Claude Code as Anthropic `thinking` blocks.
+Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
+search X use Grok's hosted `x_search` tool, with citations and search usage
+reported in Claude Code.
+
+Authentication uses browser OAuth with S256 PKCE through `auth.x.ai` and an
+ephemeral loopback callback. Headless hosts can use the OAuth device-code flow
+(`grok auth device`) instead, which prints a verification URL and user code and
+polls the same issuer. The proxy stores its own access and refresh tokens,
+refreshes them five minutes before expiry, and does not use `~/.grok/auth.json`.
+
+| Command            | What it does                          |
+| ------------------ | ------------------------------------- |
+| `grok auth login`  | Browser OAuth with a local callback   |
+| `grok auth device` | Device-code OAuth for headless hosts  |
+| `grok auth status` | Show token expiry and storage path    |
+| `grok auth logout` | Delete proxy-owned credentials        |
 
 ### Cursor Agent
 
@@ -468,6 +519,12 @@ claude-code-proxy codex auth login
 Sign in with your **ChatGPT Plus/Pro account**, not an OpenAI API account. The
 token file includes the extracted `chatgpt_account_id` so the proxy can set the
 `ChatGPT-Account-Id` header on every upstream call.
+
+The proxy owns and rotates its Codex credentials independently. It does not read
+or modify native Codex CLI credentials in `~/.codex` or native Codex credential
+backends. If an earlier proxy version used your native Codex login implicitly,
+run `claude-code-proxy codex auth login` or
+`claude-code-proxy codex auth device` once after upgrading.
 
 #### `codex auth device`
 
@@ -630,6 +687,10 @@ Windows, and at
     "oauthHost": "https://auth.kimi.com",
     "baseUrl": "https://api.kimi.com/coding/v1"
   },
+  "grok": {
+    "baseUrl": "https://cli-chat-proxy.grok.com/v1",
+    "clientVersion": "0.2.93"
+  },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
     "clientVersion": "cli-2026.06.04-5fd875e",
@@ -654,7 +715,7 @@ Windows, and at
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-iterra`) |
-| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`)                                                                                      |
+| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
@@ -663,6 +724,8 @@ Windows, and at
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
 | `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                                                                                     |
+| `CCP_GROK_BASE_URL`              | `grok.baseUrl`             | `https://cli-chat-proxy.grok.com/v1`              | Override the Grok Responses API base URL                                                                                                                                          |
+| `CCP_GROK_CLIENT_VERSION`        | `grok.clientVersion`       | `0.2.93`                                          | Override the Grok client version header                                                                                                                                           |
 | `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                                                                    |
 | `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                                                                            |
 | `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                                                                          |
@@ -736,8 +799,10 @@ CCP_TRAFFIC_LOG=1`.
 
 ## Limitations
 
-- **Terms of service:** using the Codex, Kimi, or Cursor backends from a non-official
-  client is a gray area. Use at your own risk.
+- **Terms of service:** OpenAI has [publicly welcomed using Codex through other
+  coding harnesses](https://x.com/thsottiaux/status/2075830097488249060), though
+  this does not guarantee future policy or account enforcement. Using the Kimi
+  or Cursor backends from an unofficial client may carry account risk.
 - **Rate limits:** shared across all clients of your upstream account. Codex's
   `codex.rate_limits.limit_reached` and Kimi's HTTP 429 are both surfaced as
   HTTP 429 with `retry-after`.
@@ -775,19 +840,6 @@ cargo test --all                           # run tests
 cargo fmt --all --check                    # check formatting
 cargo clippy --all-targets -- -D warnings  # lint
 just check                                 # run the full project check
-```
-
-### Smoke coverage
-
-See [docs/smoke-cutover.md](docs/smoke-cutover.md) for automated smoke tests,
-optional real-auth validation steps, known transport differences, and the
-current Rust support scope.
-
-**Install a compiled dev build globally:** compile the current working tree to a
-binary and place it on your `PATH` without linking:
-
-```sh
-cargo install --path . --locked
 ```
 
 ## Related projects

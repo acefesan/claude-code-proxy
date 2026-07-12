@@ -14,6 +14,8 @@ const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 enum LiveBlock {
     Text {
         index: usize,
+        text: String,
+        deferred: bool,
     },
     Tool {
         index: usize,
@@ -26,6 +28,19 @@ enum LiveBlock {
     },
 }
 
+struct LiveWebSearch {
+    index: usize,
+    result_index: usize,
+    id: String,
+    query: String,
+}
+
+#[derive(Clone)]
+struct LiveWebSearchResult {
+    title: String,
+    url: String,
+}
+
 pub struct LiveStreamTranslator {
     message_id: String,
     model: String,
@@ -36,6 +51,9 @@ pub struct LiveStreamTranslator {
     thinking_index: Option<usize>,
     saw_tool_use: bool,
     web_search_requests: usize,
+    web_searches: Vec<LiveWebSearch>,
+    web_search_results: Vec<LiveWebSearchResult>,
+    deferred_text: Vec<(usize, String)>,
     finished: bool,
 }
 
@@ -51,6 +69,9 @@ impl LiveStreamTranslator {
             thinking_index: None,
             saw_tool_use: false,
             web_search_requests: 0,
+            web_searches: Vec::new(),
+            web_search_results: Vec::new(),
+            deferred_text: Vec::new(),
             finished: false,
         }
     }
@@ -107,6 +128,9 @@ impl LiveStreamTranslator {
             }
             "response.output_text.delta" => {
                 self.text_delta(payload, traffic, &mut out);
+            }
+            "response.output_text.annotation.added" => {
+                self.web_search_annotation(payload);
             }
             "response.function_call_arguments.delta" => {
                 self.tool_delta(payload, traffic, &mut out)?;
@@ -240,19 +264,28 @@ impl LiveStreamTranslator {
                     self.item_id_to_output_index
                         .insert(id.to_string(), output_index);
                 }
-                self.blocks_by_output_index
-                    .insert(output_index, LiveBlock::Text { index });
-                self.ensure_message_start(traffic, out);
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_start",
-                    &serde_json::json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
+                let deferred = !self.web_searches.is_empty();
+                self.blocks_by_output_index.insert(
+                    output_index,
+                    LiveBlock::Text {
+                        index,
+                        text: String::new(),
+                        deferred,
+                    },
                 );
+                if !deferred {
+                    self.ensure_message_start(traffic, out);
+                    self.emit(
+                        traffic,
+                        out,
+                        "content_block_start",
+                        &serde_json::json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {"type": "text", "text": ""}
+                        }),
+                    );
+                }
             }
             "function_call" => {
                 self.close_thinking(traffic, out);
@@ -371,24 +404,42 @@ impl LiveStreamTranslator {
         if !self.blocks_by_output_index.contains_key(&output_index) {
             let index = self.anthropic_index;
             self.anthropic_index += 1;
-            self.blocks_by_output_index
-                .insert(output_index, LiveBlock::Text { index });
-            self.ensure_message_start(traffic, out);
-            self.emit(
-                traffic,
-                out,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""}
-                }),
+            let deferred = !self.web_searches.is_empty();
+            self.blocks_by_output_index.insert(
+                output_index,
+                LiveBlock::Text {
+                    index,
+                    text: String::new(),
+                    deferred,
+                },
             );
+            if !deferred {
+                self.ensure_message_start(traffic, out);
+                self.emit(
+                    traffic,
+                    out,
+                    "content_block_start",
+                    &serde_json::json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                );
+            }
         }
 
-        let Some(LiveBlock::Text { index }) = self.blocks_by_output_index.get(&output_index) else {
+        let Some(LiveBlock::Text {
+            index,
+            text,
+            deferred,
+        }) = self.blocks_by_output_index.get_mut(&output_index)
+        else {
             return;
         };
+        text.push_str(delta);
+        if *deferred {
+            return;
+        }
         let index = *index;
         self.emit(
             traffic,
@@ -534,21 +585,51 @@ impl LiveStreamTranslator {
             return;
         }
 
+        if payload
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("web_search_call")
+        {
+            self.close_thinking(traffic, out);
+            let item = &payload["item"];
+            let index = self.anthropic_index;
+            self.anthropic_index += 1;
+            let result_index = self.anthropic_index;
+            self.anthropic_index += 1;
+            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            self.web_searches.push(LiveWebSearch {
+                index,
+                result_index,
+                id: super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id),
+                query: web_search_query(item),
+            });
+            return;
+        }
+
         let Some(mut state) = self.blocks_by_output_index.remove(&output_index) else {
             return;
         };
 
         match &mut state {
-            LiveBlock::Text { index } => {
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_stop",
-                    &serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": index,
-                    }),
-                );
+            LiveBlock::Text {
+                index,
+                text,
+                deferred,
+            } => {
+                if *deferred {
+                    self.deferred_text.push((*index, std::mem::take(text)));
+                } else {
+                    self.emit(
+                        traffic,
+                        out,
+                        "content_block_stop",
+                        &serde_json::json!({
+                            "type": "content_block_stop",
+                            "index": index,
+                        }),
+                    );
+                }
             }
             LiveBlock::Tool {
                 index,
@@ -601,6 +682,137 @@ impl LiveStreamTranslator {
         }
     }
 
+    fn web_search_annotation(&mut self, payload: &serde_json::Value) {
+        let Some(annotation) = payload.get("annotation") else {
+            return;
+        };
+        if annotation.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
+            return;
+        }
+        let Some(url) = annotation.get("url").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if self
+            .web_search_results
+            .iter()
+            .any(|result| result.url == url)
+        {
+            return;
+        }
+        let title = annotation
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|title| !title.is_empty())
+            .unwrap_or(url);
+        self.web_search_results.push(LiveWebSearchResult {
+            title: title.to_string(),
+            url: url.to_string(),
+        });
+    }
+
+    fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
+        let searches = std::mem::take(&mut self.web_searches);
+        for search in searches {
+            self.ensure_message_start(traffic, out);
+            self.emit(
+                traffic,
+                out,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": search.index,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": search.id,
+                        "name": "web_search",
+                        "input": {}
+                    }
+                }),
+            );
+            self.emit(
+                traffic,
+                out,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": search.index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": serde_json::to_string(&serde_json::json!({"query": search.query})).unwrap_or_default()
+                    }
+                }),
+            );
+            self.emit(
+                traffic,
+                out,
+                "content_block_stop",
+                &serde_json::json!({"type": "content_block_stop", "index": search.index}),
+            );
+            let results: Vec<_> = self
+                .web_search_results
+                .iter()
+                .map(|result| {
+                    serde_json::json!({
+                        "type": "web_search_result",
+                        "title": result.title,
+                        "url": result.url,
+                    })
+                })
+                .collect();
+            self.emit(
+                traffic,
+                out,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": search.result_index,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": search.id,
+                        "content": results
+                    }
+                }),
+            );
+            self.emit(
+                traffic,
+                out,
+                "content_block_stop",
+                &serde_json::json!({"type": "content_block_stop", "index": search.result_index}),
+            );
+        }
+
+        for (index, text) in std::mem::take(&mut self.deferred_text) {
+            self.emit(
+                traffic,
+                out,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            );
+            if !text.is_empty() {
+                self.emit(
+                    traffic,
+                    out,
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                );
+            }
+            self.emit(
+                traffic,
+                out,
+                "content_block_stop",
+                &serde_json::json!({"type": "content_block_stop", "index": index}),
+            );
+        }
+    }
+
     fn finish(
         &mut self,
         payload: &serde_json::Value,
@@ -609,6 +821,7 @@ impl LiveStreamTranslator {
     ) {
         self.close_thinking(traffic, out);
         self.close_open_blocks(traffic, out);
+        self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
         let incomplete = response_is_incomplete(payload);
@@ -660,7 +873,15 @@ impl LiveStreamTranslator {
                 continue;
             };
             let index = match state {
-                LiveBlock::Text { index } => index,
+                LiveBlock::Text {
+                    index,
+                    text,
+                    deferred: true,
+                } => {
+                    self.deferred_text.push((index, text));
+                    continue;
+                }
+                LiveBlock::Text { index, .. } => index,
                 LiveBlock::Tool { index, .. } => index,
             };
             self.emit(
@@ -689,6 +910,23 @@ impl LiveStreamTranslator {
             }),
         );
     }
+}
+
+fn web_search_query(item: &serde_json::Value) -> String {
+    let Some(action) = item.get("action") else {
+        return String::new();
+    };
+    action
+        .get("query")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            action
+                .get("queries")
+                .and_then(|v| v.as_array())
+                .and_then(|queries| queries.iter().find_map(|query| query.as_str()))
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
 fn output_index(payload: &serde_json::Value) -> usize {
@@ -994,6 +1232,60 @@ mod tests {
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(!rendered.contains("event: error"));
+    }
+
+    #[test]
+    fn emits_web_search_results_from_citations_before_deferred_text() {
+        let out = render(vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {"query": "grok reasoning effort"}
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 1,
+                "delta": "See the official docs."
+            }),
+            json!({
+                "type": "response.output_text.annotation.added",
+                "annotation": {
+                    "type": "url_citation",
+                    "title": "Reasoning",
+                    "url": "https://docs.x.ai/docs/guides/reasoning"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"type": "message"}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "usage": {}}
+            }),
+        ]);
+
+        let tool = out.find("server_tool_use").unwrap();
+        let result = out.find("web_search_tool_result").unwrap();
+        let text = out.find("See the official docs.").unwrap();
+        assert!(tool < result && result < text);
+        assert!(out.contains("https://docs.x.ai/docs/guides/reasoning"));
+        assert!(out.contains(r#""web_search_requests":1"#));
     }
 
     #[test]

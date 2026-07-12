@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config,
+    config, logging,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
@@ -52,6 +52,10 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    Grok {
+        #[command(subcommand)]
+        command: ProviderGroup,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -97,6 +101,7 @@ fn main() -> Result<()> {
                         .map_err(|err| anyhow::anyhow!(err))
                 }
                 ServeMode::Monitor => {
+                    let _stderr_guard = logging::suppress_stderr();
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let listener = runtime.block_on(server::bind_proxy_listener(effective_port))?;
@@ -129,6 +134,7 @@ fn main() -> Result<()> {
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
+        Commands::Grok { command } => run_provider_cli("grok", command),
     }
 }
 
@@ -188,7 +194,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "cursor"] {
+    for provider in ["codex", "kimi", "grok", "cursor"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };

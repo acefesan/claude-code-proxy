@@ -232,12 +232,8 @@ fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
     false
 }
 
-fn extract_status_from_error(payload: &serde_json::Value) -> Option<u16> {
-    payload
-        .get("error")
-        .and_then(|e| e.get("status"))
-        .and_then(|v| v.as_u64())
-        .map(|s| s as u16)
+pub(super) fn event_error_status(payload: &serde_json::Value) -> Option<u16> {
+    super::events::classify_event_failure(payload).and_then(|failure| failure.explicit_status)
 }
 
 #[allow(dead_code)]
@@ -270,7 +266,7 @@ pub async fn codex_websocket_request(
         message: e.message,
         detail: None,
         retry_after: None,
-        origin: CodexErrorOrigin::WebSocket,
+        origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let body_json = serde_json::to_string(body_value).unwrap_or_default();
     if let Some(tc) = traffic {
@@ -348,7 +344,7 @@ pub async fn codex_websocket_request(
 
             // Extract status from error events
             let status = if terminal_event.event_type == "error" {
-                extract_status_from_error(&terminal_event.payload).unwrap_or(500)
+                event_error_status(&terminal_event.payload).unwrap_or(500)
             } else {
                 200
             };
@@ -415,7 +411,7 @@ pub async fn codex_websocket_request(
         }
 
         let status = if terminal_event.event_type == "error" {
-            extract_status_from_error(&terminal_event.payload).unwrap_or(500)
+            event_error_status(&terminal_event.payload).unwrap_or(500)
         } else {
             200
         };
@@ -682,32 +678,36 @@ async fn connect_with_timeout(
         .map_err(|_| CodexError {
             status: 0,
             message: format!("WebSocket connect timeout after {connect_timeout_ms}ms"),
-            detail: Some("websocket_pre_request".to_string()),
+            detail: None,
             retry_after: None,
-            origin: CodexErrorOrigin::WebSocket,
+            origin: CodexErrorOrigin::WebSocketHandshake,
         })?
         .map_err(|e| {
-            let msg = e.to_string();
-            // Map auth failures to proper status codes
-            let status = if msg.contains("401") || msg.contains("Unauthorized") {
-                Some(401u16)
-            } else if msg.contains("403") || msg.contains("Forbidden") {
-                Some(403u16)
-            } else if msg.contains("429") || msg.contains("Rate") {
-                Some(429u16)
-            } else {
-                None
+            let (status, retry_after, detail) = match &e {
+                tungstenite::Error::Http(response) => {
+                    let detail = response
+                        .body()
+                        .as_ref()
+                        .and_then(|body| String::from_utf8(body.clone()).ok())
+                        .filter(|body| !body.trim().is_empty());
+                    (
+                        Some(response.status().as_u16()),
+                        response
+                            .headers()
+                            .get(http::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                        detail,
+                    )
+                }
+                _ => (None, None, None),
             };
             CodexError {
                 status: status.unwrap_or(0),
                 message: format!("WebSocket connect error: {e}"),
-                detail: if status.is_none() {
-                    Some("websocket_pre_request".to_string())
-                } else {
-                    None
-                },
-                retry_after: None,
-                origin: CodexErrorOrigin::WebSocket,
+                detail,
+                retry_after,
+                origin: CodexErrorOrigin::WebSocketHandshake,
             }
         })
 }
@@ -994,7 +994,7 @@ async fn stream_ws_events(
                 }
 
                 if parsed.get("type").and_then(|v| v.as_str()) == Some("error") {
-                    status = extract_status_from_error(&parsed).unwrap_or(500);
+                    status = event_error_status(&parsed).unwrap_or(500);
                 }
                 let terminal = is_terminal_event(&parsed);
                 if terminal && is_previous_response_missing(&parsed) {
@@ -1110,6 +1110,32 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_error_status_requires_error_event_and_checks_numeric_fallbacks() {
+        assert_eq!(
+            event_error_status(&serde_json::json!({
+                "type": "response.failed",
+                "status": "failed",
+                "status_code": 401
+            })),
+            Some(401)
+        );
+        assert_eq!(
+            event_error_status(&serde_json::json!({
+                "type": "response.completed",
+                "status_code": 401
+            })),
+            None
+        );
+        assert_eq!(
+            event_error_status(&serde_json::json!({
+                "type": "error",
+                "error": {"status": 401}
+            })),
+            Some(401)
+        );
+    }
 
     #[test]
     fn websocket_url_conversion() {
@@ -1248,7 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_connect_401_is_statusful_auth_error() {
+    async fn websocket_connect_401_is_pre_request_handshake_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1259,7 +1285,7 @@ mod tests {
             let mut buf = [0_u8; 2048];
             let _ = socket.read(&mut buf).await;
             socket
-                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\n\r\npolicy denied")
                 .await
                 .unwrap();
         });
@@ -1276,8 +1302,44 @@ mod tests {
         };
 
         assert_eq!(err.status, 401);
+        assert_eq!(err.detail.as_deref(), Some("policy denied"));
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_502_preserves_retry_metadata() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nRetry-After: 3\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let err = match connect_with_timeout(
+            &format!("ws://{addr}/backend-api/codex/responses"),
+            &HeaderMap::new(),
+            1_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected websocket handshake to fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, 502);
         assert_eq!(err.detail, None);
-        assert_eq!(err.origin, CodexErrorOrigin::WebSocket);
+        assert_eq!(err.retry_after.as_deref(), Some("3"));
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
     }
 
     #[tokio::test]

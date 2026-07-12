@@ -2,6 +2,7 @@ pub mod auth;
 pub mod client;
 pub mod continuation;
 pub mod count_tokens;
+pub(crate) mod events;
 pub mod request_summary;
 pub mod translate;
 pub mod websocket;
@@ -37,7 +38,7 @@ use self::translate::model_allowlist::{
     assert_allowed_model, resolve_model_request, uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
-use self::translate::request::{TranslateOptions, translate_request};
+use self::translate::request::{TranslateOptions, has_hosted_web_search, translate_request};
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 use self::translate::stream::translate_stream_bytes_with_traffic;
@@ -46,7 +47,9 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // Provider
 // ---------------------------------------------------------------------------
 
-pub struct CodexProvider;
+pub struct CodexProvider {
+    client: Arc<CodexHttpClient>,
+}
 
 impl Default for CodexProvider {
     fn default() -> Self {
@@ -56,7 +59,9 @@ impl Default for CodexProvider {
 
 impl CodexProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            client: Arc::new(CodexHttpClient::new()),
+        }
     }
 }
 
@@ -109,7 +114,8 @@ impl Provider for CodexProvider {
                 session_id: ctx.session_id.clone(),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
-                use_responses_lite: uses_responses_lite(&resolved.model),
+                use_responses_lite: uses_responses_lite(&resolved.model)
+                    && !has_hosted_web_search(&body),
             },
         ) {
             Ok(t) => t,
@@ -131,7 +137,7 @@ impl Provider for CodexProvider {
         );
 
         // Post to upstream with continuation
-        let client = Arc::new(CodexHttpClient::new());
+        let client = self.client.clone();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -250,7 +256,8 @@ impl Provider for CodexProvider {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
-                use_responses_lite: uses_responses_lite(&resolved.model),
+                use_responses_lite: uses_responses_lite(&resolved.model)
+                    && !has_hosted_web_search(&body),
             },
         ) {
             Ok(t) => t,
@@ -284,8 +291,7 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
 enum LiveStreamStart {
     Response(Response),
     Retry {
-        message: String,
-        retry_after: Option<String>,
+        error: client::CodexError,
         full_context: bool,
     },
 }
@@ -345,8 +351,7 @@ async fn live_stream_response(
         {
             LiveStreamStart::Response(response) => return response,
             LiveStreamStart::Retry {
-                message,
-                retry_after,
+                error,
                 full_context,
             } => {
                 if full_context && drop_live_continuation_for_retry(&mut continuation, &ctx) {
@@ -355,12 +360,12 @@ async fn live_stream_response(
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     clear_continuation(ctx.session_id.as_deref());
-                    return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
+                    return map_codex_error_to_response(&error);
                 }
-                let delay = compute_backoff_delay(attempt, retry_after.as_deref());
+                let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
                     clear_continuation(ctx.session_id.as_deref());
-                    return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
+                    return map_codex_error_to_response(&error);
                 }
                 attempt += 1;
                 sleep(delay.wait_ms).await;
@@ -386,8 +391,7 @@ async fn live_stream_response_once(
                 if retryable_live_start_codex_error(&err) {
                     let full_context = retry_with_full_context_for_live_error(&err);
                     return LiveStreamStart::Retry {
-                        message: codex_error_message(&err).to_string(),
-                        retry_after: err.retry_after,
+                        error: err,
                         full_context,
                     };
                 }
@@ -401,9 +405,36 @@ async fn live_stream_response_once(
             Ok(result) => result,
             Err(message) => {
                 if retryable_live_start_payload(&payload, &message) {
+                    let lower_message = message.to_ascii_lowercase();
+                    let status = websocket::event_error_status(&payload).unwrap_or_else(|| {
+                        let error = payload.get("error").or_else(|| {
+                            payload.get("response").and_then(|value| value.get("error"))
+                        });
+                        let overloaded = error.is_some_and(|error| {
+                            error.get("code").and_then(|value| value.as_str())
+                                == Some("overloaded_error")
+                                || error.get("type").and_then(|value| value.as_str())
+                                    == Some("overloaded_error")
+                        });
+                        if payload.get("type").and_then(|value| value.as_str())
+                            == Some("codex.rate_limits")
+                            || lower_message.contains("rate limit")
+                        {
+                            429
+                        } else if overloaded || lower_message.contains("overloaded") {
+                            529
+                        } else {
+                            503
+                        }
+                    });
                     return LiveStreamStart::Retry {
-                        message,
-                        retry_after: retry_after_from_live_payload(&payload),
+                        error: client::CodexError {
+                            status,
+                            message: message.clone(),
+                            detail: Some(message),
+                            retry_after: retry_after_from_live_payload(&payload),
+                            origin: client::CodexErrorOrigin::WebSocket,
+                        },
                         full_context: false,
                     };
                 }
@@ -441,8 +472,13 @@ async fn live_stream_response_once(
     }
 
     LiveStreamStart::Retry {
-        message: "WebSocket connection closed before terminal Codex response event".to_string(),
-        retry_after: None,
+        error: client::CodexError {
+            status: 0,
+            message: "WebSocket connection closed before terminal Codex response event".to_string(),
+            detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        },
         full_context: true,
     }
 }
@@ -614,6 +650,9 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
+        return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
+    }
     matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
 }
@@ -644,114 +683,27 @@ fn drop_live_continuation_for_retry(
     true
 }
 
-fn retryable_live_start_payload(payload: &serde_json::Value, message: &str) -> bool {
-    if payload.get("type").and_then(|v| v.as_str()) == Some("codex.rate_limits")
-        && payload
-            .get("rate_limits")
-            .and_then(|r| r.get("limit_reached"))
-            .and_then(|v| v.as_bool())
-            == Some(true)
-    {
-        return true;
-    }
+fn retryable_live_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "overloaded",
+        "rate limit",
+        "you can retry your request",
+        "temporarily unavailable",
+        "timed out",
+        "connection closed",
+        "connection reset",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
 
-    let status = payload
-        .get("status")
-        .or_else(|| payload.get("status_code"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("status"))
-                .and_then(|v| v.as_u64())
-        })
-        .or_else(|| {
-            payload
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("status"))
-                .and_then(|v| v.as_u64())
-        });
-    if matches!(status, Some(429 | 500 | 502 | 503 | 504 | 529)) {
-        return true;
-    }
-
-    let code = payload
-        .get("error")
-        .and_then(|e| e.get("code"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("code"))
-                .and_then(|v| v.as_str())
-        });
-    let err_type = payload
-        .get("error")
-        .and_then(|e| e.get("type"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("type"))
-                .and_then(|v| v.as_str())
-        });
-    code == Some("overloaded_error")
-        || err_type == Some("overloaded_error")
-        || retryable_live_message(message)
+fn retryable_live_start_payload(payload: &serde_json::Value, _message: &str) -> bool {
+    events::classify_event_failure(payload).is_some_and(|failure| failure.retryable())
 }
 
 fn retry_after_from_live_payload(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("rate_limits")
-        .and_then(|r| r.get("primary"))
-        .and_then(|r| r.get("reset_after_seconds"))
-        .map(json_scalar_to_string)
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("retry_after"))
-                .map(json_scalar_to_string)
-        })
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("retry_after_seconds"))
-                .map(json_scalar_to_string)
-        })
-        .or_else(|| {
-            payload
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("retry_after_seconds"))
-                .map(json_scalar_to_string)
-        })
-        .or_else(|| {
-            payload
-                .get("headers")
-                .and_then(|h| h.get("retry-after"))
-                .map(json_scalar_to_string)
-        })
-}
-
-fn json_scalar_to_string(value: &serde_json::Value) -> String {
-    value
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn retryable_live_message(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    lower.contains("overloaded")
-        || lower.contains("rate limit")
-        || lower.contains("you can retry your request")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("timed out")
-        || lower.contains("connection closed")
-        || lower.contains("connection reset")
+    events::classify_event_failure(payload).and_then(|failure| failure.retry_after)
 }
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
@@ -812,7 +764,33 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             let headers = [(http::header::RETRY_AFTER, retry_after)];
             (headers, resp).into_response()
         }
-        _ => json_error(StatusCode::BAD_GATEWAY, "api_error", message),
+        status @ (500 | 502 | 503 | 504 | 529)
+            if matches!(
+                err.origin,
+                client::CodexErrorOrigin::BufferedHttp
+                    | client::CodexErrorOrigin::BufferedWebSocket
+            ) =>
+        {
+            let response = json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                if status == 529 {
+                    "overloaded_error"
+                } else {
+                    "api_error"
+                },
+                codex_error_message(err),
+            );
+            if let Some(retry_after) = err.retry_after.as_deref() {
+                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+            } else {
+                response
+            }
+        }
+        _ => json_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            codex_error_message(err),
+        ),
     }
 }
 
@@ -1096,6 +1074,19 @@ mod tests {
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
         );
+    }
+
+    #[test]
+    fn live_start_statusless_websocket_handshake_error_is_retryable() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket connect timeout after 15000ms".to_string(),
+            detail: None,
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(retryable_live_start_codex_error(&err));
     }
 
     #[test]

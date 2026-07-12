@@ -8,6 +8,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use jiff::{Timestamp, Zoned, tz::TimeZone};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -77,6 +78,21 @@ const RECENT_TABLE_HEADERS: [(&str, Alignment); 10] = [
     ("Details", Alignment::Left),
 ];
 
+const RECENT_INDICATOR_TABLE_HEADERS: [(&str, Alignment); 10] = [
+    ("Finished", Alignment::Left),
+    ("Status", Alignment::Left),
+    ("Provider", Alignment::Left),
+    ("Model", Alignment::Left),
+    ("Effort", Alignment::Left),
+    ("Latency", Alignment::Right),
+    ("Rate", Alignment::Right),
+    ("In", Alignment::Right),
+    ("Out", Alignment::Right),
+    ("Err", Alignment::Left),
+];
+
+const RECENT_DETAIL_WIDTH: u16 = 132;
+
 const EVENTS_TABLE_HEADERS: [(&str, Alignment); 5] = [
     ("Time", Alignment::Left),
     ("Status", Alignment::Left),
@@ -102,15 +118,17 @@ pub fn run_monitor(
         setup_text: setup_text(config.port, config.registry),
         show_setup: false,
         show_help: false,
-        detail: false,
+        detail: None,
+        focus: FocusPane::Sessions,
         selected: 0,
+        recent_selected: 0,
         tick: 0,
         shutdown: config.shutdown,
     };
 
     loop {
         let state = handle.snapshot();
-        app.clamp_selection(state.sessions.len());
+        app.clamp_selection(state.sessions.len(), state.recent.len());
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, &mut app, &state))?;
         if event::poll(Duration::from_millis(250))? {
@@ -130,23 +148,35 @@ pub fn run_monitor(
                     }
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.selected = app
-                            .selected
-                            .saturating_add(1)
-                            .min(state.sessions.len().saturating_sub(1))
+                    KeyCode::Tab => app.focus = app.focus.next(),
+                    KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
+                    KeyCode::Char('j') => {
+                        app.move_down(state.sessions.len(), state.recent.len(), false)
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.selected = app.selected.saturating_sub(1)
+                    KeyCode::Up => app.move_up(state.sessions.len(), state.recent.len(), true),
+                    KeyCode::Char('k') => {
+                        app.move_up(state.sessions.len(), state.recent.len(), false)
                     }
-                    KeyCode::Enter => app.detail = true,
+                    KeyCode::Right => app.focus = FocusPane::Recent,
+                    KeyCode::Left => app.focus = FocusPane::Sessions,
+                    KeyCode::Enter => {
+                        app.detail = match app.focus {
+                            FocusPane::Sessions if !state.sessions.is_empty() => {
+                                Some(DetailView::Session)
+                            }
+                            FocusPane::Recent if !state.recent.is_empty() => {
+                                Some(DetailView::Request)
+                            }
+                            _ => None,
+                        }
+                    }
                     KeyCode::Esc => {
                         if app.show_help {
                             app.show_help = false;
                         } else if app.show_setup {
                             app.show_setup = false;
                         } else {
-                            app.detail = false;
+                            app.detail = None;
                         }
                     }
                     _ => {}
@@ -160,20 +190,83 @@ pub fn run_monitor(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusPane {
+    Sessions,
+    Recent,
+}
+
+impl FocusPane {
+    fn next(self) -> Self {
+        match self {
+            Self::Sessions => Self::Recent,
+            Self::Recent => Self::Sessions,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailView {
+    Session,
+    Request,
+}
+
 struct MonitorApp {
     port: u16,
     setup_text: String,
     show_setup: bool,
     show_help: bool,
-    detail: bool,
+    detail: Option<DetailView>,
+    focus: FocusPane,
     selected: usize,
+    recent_selected: usize,
     tick: usize,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl MonitorApp {
-    fn clamp_selection(&mut self, len: usize) {
-        self.selected = self.selected.min(len.saturating_sub(1));
+    fn clamp_selection(&mut self, sessions: usize, recent: usize) {
+        self.selected = self.selected.min(sessions.saturating_sub(1));
+        self.recent_selected = self.recent_selected.min(recent.saturating_sub(1));
+    }
+
+    fn move_down(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
+        match self.focus {
+            FocusPane::Sessions => {
+                if switch_panes && self.selected >= sessions.saturating_sub(1) && recent > 0 {
+                    self.focus = FocusPane::Recent;
+                    self.recent_selected = 0;
+                } else {
+                    self.selected = self
+                        .selected
+                        .saturating_add(1)
+                        .min(sessions.saturating_sub(1));
+                }
+            }
+            FocusPane::Recent => {
+                self.recent_selected = self
+                    .recent_selected
+                    .saturating_add(1)
+                    .min(recent.saturating_sub(1));
+            }
+        }
+    }
+
+    fn move_up(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
+        match self.focus {
+            FocusPane::Sessions => self.selected = self.selected.saturating_sub(1),
+            FocusPane::Recent => {
+                if switch_panes && self.recent_selected == 0 && sessions > 0 {
+                    self.focus = FocusPane::Sessions;
+                    self.selected = sessions.saturating_sub(1);
+                } else {
+                    self.recent_selected = self
+                        .recent_selected
+                        .saturating_sub(1)
+                        .min(recent.saturating_sub(1));
+                }
+            }
+        }
     }
 }
 
@@ -220,13 +313,27 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         .split(area);
 
     render_header(frame, root[0], app, state);
-    if app.detail {
-        render_session_detail(frame, root[1], state, app.selected);
-    } else {
-        render_sessions(frame, root[1], &state.sessions, app.selected);
+    match app.detail {
+        Some(DetailView::Session) => render_session_detail(frame, root[1], state, app.selected),
+        Some(DetailView::Request) => {
+            render_request_detail(frame, root[1], state, app.recent_selected)
+        }
+        None => render_sessions(
+            frame,
+            root[1],
+            &state.sessions,
+            app.selected,
+            app.focus == FocusPane::Sessions,
+        ),
     }
     render_active(frame, root[2], &state.active, app.tick);
-    render_recent(frame, root[3], &state.recent);
+    render_recent(
+        frame,
+        root[3],
+        &state.recent,
+        app.recent_selected,
+        app.focus == FocusPane::Recent,
+    );
     render_events(frame, root[4], &state.recent);
     render_footer(frame, root[5], app);
 
@@ -426,12 +533,16 @@ fn status_color(value: &str) -> Color {
 }
 
 fn http_status_style(status: Option<u16>) -> Style {
+    Style::default().fg(http_status_color(status))
+}
+
+fn http_status_color(status: Option<u16>) -> Color {
     match status {
-        Some(200..=299) => Style::default().fg(GREEN),
-        Some(400..=499) => Style::default().fg(YELLOW),
-        Some(500..=599) => Style::default().fg(RED),
-        Some(_) => Style::default().fg(DIM_WHITE),
-        None => Style::default().fg(DIM),
+        Some(200..=299) => GREEN,
+        Some(400..=499) => YELLOW,
+        Some(500..=599) => RED,
+        Some(_) => DIM_WHITE,
+        None => DIM,
     }
 }
 
@@ -468,6 +579,20 @@ fn detail_cell(value: &str) -> Cell<'static> {
     }
 }
 
+fn error_indicator(request: &CompletedRequest) -> &'static str {
+    if request.status == crate::monitor::RequestStatus::Failed
+        || request.http_status.is_some_and(|status| status >= 400)
+        || request
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.is_empty())
+    {
+        "!"
+    } else {
+        ""
+    }
+}
+
 fn compact_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -492,9 +617,10 @@ fn render_sessions(
     area: Rect,
     sessions: &[SessionSummary],
     selected: usize,
+    focused: bool,
 ) {
     if sessions.is_empty() {
-        render_empty_table_state(frame, area, "Sessions", true, "No sessions");
+        render_empty_table_state(frame, area, "Sessions", focused, "No sessions");
         return;
     }
 
@@ -514,7 +640,11 @@ fn render_sessions(
     ];
     let model_width = table_column_width(area, &widths, 6);
     let rows = sessions.iter().enumerate().map(|(index, session)| {
-        let marker = if index == selected { ">" } else { " " };
+        let marker = if focused && index == selected {
+            ">"
+        } else {
+            " "
+        };
         Row::new(vec![
             Cell::from(Span::styled(marker, Style::default().fg(TEAL))),
             text_cell(display_session_id(session.session_id.as_deref())),
@@ -537,7 +667,7 @@ fn render_sessions(
     });
     let table = Table::new(rows, widths)
         .header(table_header_aligned(SESSION_TABLE_HEADERS))
-        .block(panel("Sessions", true));
+        .block(panel("Sessions", focused));
     frame.render_widget(table, area);
 }
 
@@ -554,12 +684,12 @@ fn render_active(
 
     let widths = [
         Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(8),
         Constraint::Min(18),
-        Constraint::Length(7),
-        Constraint::Length(12),
-        Constraint::Length(13),
-        Constraint::Length(12),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(14),
+        Constraint::Length(10),
         Constraint::Length(9),
     ];
     let model_width = table_column_width(area, &widths, 2);
@@ -590,26 +720,59 @@ fn render_active(
     frame.render_widget(table, area);
 }
 
-fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
+fn render_recent(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    recent: &[CompletedRequest],
+    selected: usize,
+    focused: bool,
+) {
     if recent.is_empty() {
-        render_empty_table_state(frame, area, "Recent requests", false, "No recent requests");
+        render_empty_table_state(
+            frame,
+            area,
+            "Recent requests",
+            focused,
+            "No recent requests",
+        );
         return;
     }
 
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(6),
-        Constraint::Length(8),
-        Constraint::Length(RECENT_MODEL_WIDTH),
-        Constraint::Length(7),
-        Constraint::Length(8),
-        Constraint::Length(12),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Fill(1),
-    ];
+    let show_detail = area.width >= RECENT_DETAIL_WIDTH;
+    let widths = if show_detail {
+        vec![
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(RECENT_MODEL_WIDTH),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Fill(1),
+        ]
+    } else {
+        vec![
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(if area.width >= 105 { 18 } else { 12 }),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(3),
+        ]
+    };
     let model_width = table_column_width(area, &widths, 3);
-    let rows = recent.iter().map(|request| {
+    let rows = recent.iter().enumerate().map(|(index, request)| {
+        let detail = if show_detail {
+            request.error.as_deref().unwrap_or("")
+        } else {
+            error_indicator(request)
+        };
         Row::new(vec![
             muted_cell(format_system_time(request.finished_at)),
             Cell::from(Span::styled(
@@ -626,13 +789,22 @@ fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
             rate_cell(request.rate().label()),
             number_cell(token_value(request.input_tokens)),
             number_cell(token_value(request.output_tokens)),
-            detail_cell(request.error.as_deref().unwrap_or("")),
+            detail_cell(detail),
         ])
-        .style(Style::default().bg(PANEL_BG))
+        .style(if focused && index == selected {
+            Style::default().bg(SELECTED_BG)
+        } else {
+            Style::default().bg(PANEL_BG)
+        })
     });
+    let headers = if show_detail {
+        RECENT_TABLE_HEADERS
+    } else {
+        RECENT_INDICATOR_TABLE_HEADERS
+    };
     let table = Table::new(rows, widths)
-        .header(table_header_aligned(RECENT_TABLE_HEADERS))
-        .block(panel("Recent requests", false));
+        .header(table_header_aligned(headers))
+        .block(panel("Recent requests", focused));
     frame.render_widget(table, area);
 }
 
@@ -743,6 +915,95 @@ fn render_session_detail(
     );
 }
 
+fn render_request_detail(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &MonitorState,
+    selected: usize,
+) {
+    let lines = if let Some(request) = state.recent.get(selected) {
+        let mut lines = vec![
+            detail_line("request", request.request_id.clone(), WHITE),
+            detail_line(
+                "session",
+                display_session_id(request.session_id.as_deref()),
+                TEAL,
+            ),
+            detail_line(
+                "session seq",
+                request
+                    .session_seq
+                    .map(|seq| seq.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                DIM_WHITE,
+            ),
+            detail_line("endpoint", request.endpoint.label(), DIM_WHITE),
+            detail_line("started", format_system_time(request.started_at), DIM_WHITE),
+            detail_line(
+                "finished",
+                format_system_time(request.finished_at),
+                DIM_WHITE,
+            ),
+            detail_line(
+                "status",
+                request.status.label(),
+                status_color(request.status.label()),
+            ),
+            detail_line(
+                "http status",
+                request
+                    .http_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                http_status_color(request.http_status),
+            ),
+            detail_line("provider", request.provider.as_deref().unwrap_or("-"), TEAL),
+            detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
+            detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
+            detail_line("latency", format_duration(request.latency), DIM_WHITE),
+            detail_line("rate", request.rate().label(), TEAL),
+            detail_line("input tokens", token_value(request.input_tokens), DIM_WHITE),
+            detail_line(
+                "output tokens",
+                token_value(request.output_tokens),
+                DIM_WHITE,
+            ),
+            detail_line(
+                "stream bytes",
+                request.streamed_bytes.to_string(),
+                DIM_WHITE,
+            ),
+            detail_line(
+                "stream chunks",
+                request.stream_chunks.to_string(),
+                DIM_WHITE,
+            ),
+        ];
+        if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
+            lines.push(detail_line("detail", error, YELLOW));
+        }
+        if let Some(path) = &request.traffic_capture_path {
+            lines.push(detail_line(
+                "capture",
+                path.to_string_lossy().into_owned(),
+                DIM_WHITE,
+            ));
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "No request selected",
+            Style::default().fg(DIM),
+        ))]
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .block(panel("Request detail", true)),
+        area,
+    );
+}
+
 fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: Color) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("  {label:<16}"), Style::default().fg(DIM)),
@@ -759,10 +1020,12 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" setup  ", Style::default().fg(DIM)),
-        Span::styled("j/k", Style::default().fg(TEAL)),
-        Span::styled(" select  ", Style::default().fg(DIM)),
+        Span::styled("arrows/j/k", Style::default().fg(TEAL)),
+        Span::styled(" navigate  ", Style::default().fg(DIM)),
+        Span::styled("Tab", Style::default().fg(TEAL)),
+        Span::styled(" pane  ", Style::default().fg(DIM)),
         Span::styled("Enter", Style::default().fg(TEAL)),
-        Span::styled(" session", Style::default().fg(DIM)),
+        Span::styled(" open", Style::default().fg(DIM)),
     ];
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
@@ -792,9 +1055,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("q / Ctrl-C", "quit proxy"),
         ("?", "toggle help"),
         ("b", "toggle setup"),
-        ("j / Down", "next session"),
-        ("k / Up", "previous session"),
-        ("Enter", "session detail"),
+        ("arrows", "navigate rows and panes"),
+        ("j / k", "previous / next row"),
+        ("Tab", "switch pane"),
+        ("Enter", "open detail"),
         ("Esc", "close overlay / detail"),
     ];
     let content = lines
@@ -903,16 +1167,16 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_system_time(time: SystemTime) -> String {
-    let Ok(duration) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+    format_system_time_in_zone(time, TimeZone::system())
+}
+
+fn format_system_time_in_zone(time: SystemTime, time_zone: TimeZone) -> String {
+    let Ok(timestamp) = Timestamp::try_from(time) else {
         return "-".to_string();
     };
-    let seconds = duration.as_secs() % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    )
+    Zoned::new(timestamp, time_zone)
+        .strftime("%H:%M:%S")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -977,6 +1241,14 @@ mod tests {
     }
 
     #[test]
+    fn format_system_time_applies_non_utc_time_zone() {
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(20 * 60 * 60);
+        let time_zone = TimeZone::fixed(jiff::tz::offset(5));
+
+        assert_eq!(format_system_time_in_zone(timestamp, time_zone), "01:00:00");
+    }
+
+    #[test]
     fn table_headers_use_expected_labels() {
         assert_eq!(
             table_header_labels(&SESSION_TABLE_HEADERS),
@@ -996,6 +1268,13 @@ mod tests {
             [
                 "Finished", "Status", "Provider", "Model", "Effort", "Latency", "Rate", "In",
                 "Out", "Details",
+            ]
+        );
+        assert_eq!(
+            table_header_labels(&RECENT_INDICATOR_TABLE_HEADERS),
+            [
+                "Finished", "Status", "Provider", "Model", "Effort", "Latency", "Rate", "In",
+                "Out", "Err",
             ]
         );
         assert_eq!(
@@ -1052,12 +1331,12 @@ mod tests {
     fn model_column_width_tracks_terminal_width() {
         let widths = [
             Constraint::Length(8),
-            Constraint::Length(10),
+            Constraint::Length(8),
             Constraint::Min(18),
-            Constraint::Length(7),
-            Constraint::Length(12),
-            Constraint::Length(13),
-            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(14),
+            Constraint::Length(10),
             Constraint::Length(9),
         ];
         let narrow = table_column_width(Rect::new(0, 0, 110, 10), &widths, 2);
@@ -1076,7 +1355,9 @@ mod tests {
 
     #[test]
     fn empty_tables_hide_columns_and_center_placeholders() {
-        let sessions = draw(40, 9, |frame| render_sessions(frame, frame.area(), &[], 0));
+        let sessions = draw(40, 9, |frame| {
+            render_sessions(frame, frame.area(), &[], 0, true)
+        });
         let sessions_text = buffer_text(&sessions);
         assert_centered(&sessions, "No sessions", 4);
         assert!(!sessions_text.contains("provider"));
@@ -1088,7 +1369,9 @@ mod tests {
         assert!(!active_text.contains("started"));
         assert!(active_text.contains("No active requests"));
 
-        let recent = draw(40, 9, |frame| render_recent(frame, frame.area(), &[]));
+        let recent = draw(40, 9, |frame| {
+            render_recent(frame, frame.area(), &[], 0, false)
+        });
         let recent_text = buffer_text(&recent);
         assert_centered(&recent, "No recent requests", 4);
         assert!(!recent_text.contains("finished"));
@@ -1099,6 +1382,21 @@ mod tests {
         assert_centered(&events, "No events", 4);
         assert!(!events_text.contains("time"));
         assert!(events_text.contains("No events"));
+    }
+
+    #[test]
+    fn active_status_keeps_full_label_at_narrow_width() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.upstream_started("request-1");
+        let state = monitor.snapshot();
+
+        let active = draw(88, 6, |frame| {
+            render_active(frame, frame.area(), &state.active, 0)
+        });
+
+        let active_text = buffer_text(&active);
+        assert!(active_text.contains("⠋ upstream"), "{active_text}");
     }
 
     #[test]
@@ -1119,7 +1417,7 @@ mod tests {
         let active_state = monitor.snapshot();
 
         let sessions = draw(160, 8, |frame| {
-            render_sessions(frame, frame.area(), &active_state.sessions, 0)
+            render_sessions(frame, frame.area(), &active_state.sessions, 0, true)
         });
         let sessions_text = buffer_text(&sessions);
         assert!(sessions_text.contains("Provider"));
@@ -1137,7 +1435,7 @@ mod tests {
         monitor.request_completed("request-1", 200, Some(100), Some(25));
         let completed_state = monitor.snapshot();
         let recent = draw(140, 8, |frame| {
-            render_recent(frame, frame.area(), &completed_state.recent)
+            render_recent(frame, frame.area(), &completed_state.recent, 0, false)
         });
         let recent_text = buffer_text(&recent);
         assert!(recent_text.contains("Finished"));
@@ -1148,6 +1446,80 @@ mod tests {
             render_events(frame, frame.area(), &completed_state.recent)
         });
         assert!(buffer_text(&events).contains("No events"));
+    }
+
+    #[test]
+    fn recent_table_uses_error_indicator_at_medium_width() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("request-1", "codex", "gpt-5.6-sol", None);
+        monitor.request_failed("request-1", Some(502), "upstream unavailable");
+        let state = monitor.snapshot();
+
+        let recent = draw(110, 8, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, true)
+        });
+        let recent_text = buffer_text(&recent);
+
+        assert!(recent_text.contains("Err"), "{recent_text}");
+        assert!(recent_text.contains("!"), "{recent_text}");
+        assert!(!recent_text.contains("Details"), "{recent_text}");
+        assert!(
+            !recent_text.contains("upstream unavailable"),
+            "{recent_text}"
+        );
+    }
+
+    #[test]
+    fn recent_table_keeps_detail_text_at_wide_width() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("request-1", "codex", "gpt-5.6-sol", None);
+        monitor.request_failed("request-1", Some(502), "upstream unavailable");
+        let state = monitor.snapshot();
+
+        let recent = draw(150, 8, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, false)
+        });
+        let recent_text = buffer_text(&recent);
+
+        assert!(recent_text.contains("Details"), "{recent_text}");
+        assert!(
+            recent_text.contains("upstream unavailable"),
+            "{recent_text}"
+        );
+    }
+
+    #[test]
+    fn request_detail_renders_full_error_text() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-1",
+            Some("sess-1".to_string()),
+            Some(7),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected(
+            "request-1",
+            "codex",
+            "gpt-5.6-sol",
+            Some("high".to_string()),
+        );
+        monitor.request_failed("request-1", Some(502), "upstream unavailable");
+        let state = monitor.snapshot();
+
+        let detail = draw(120, 20, |frame| {
+            render_request_detail(frame, frame.area(), &state, 0)
+        });
+        let detail_text = buffer_text(&detail);
+
+        assert!(detail_text.contains("Request detail"), "{detail_text}");
+        assert!(detail_text.contains("request-1"), "{detail_text}");
+        assert!(detail_text.contains("sess-1"), "{detail_text}");
+        assert!(
+            detail_text.contains("upstream unavailable"),
+            "{detail_text}"
+        );
     }
 
     #[test]
@@ -1174,16 +1546,69 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
-            detail: false,
+            detail: None,
+            focus: FocusPane::Sessions,
             selected: 10,
+            recent_selected: 10,
             tick: 0,
             shutdown: None,
         };
 
-        app.clamp_selection(3);
+        app.clamp_selection(3, 4);
         assert_eq!(app.selected, 2);
+        assert_eq!(app.recent_selected, 3);
 
-        app.clamp_selection(0);
+        app.clamp_selection(0, 0);
         assert_eq!(app.selected, 0);
+        assert_eq!(app.recent_selected, 0);
+    }
+
+    #[test]
+    fn arrow_navigation_moves_between_focus_panes_at_edges() {
+        let mut app = MonitorApp {
+            port: 3000,
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 1,
+            recent_selected: 0,
+            tick: 0,
+            shutdown: None,
+        };
+
+        app.move_down(2, 3, true);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected, 0);
+
+        app.move_up(2, 3, true);
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn vim_navigation_stays_within_focused_pane() {
+        let mut app = MonitorApp {
+            port: 3000,
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 1,
+            recent_selected: 0,
+            tick: 0,
+            shutdown: None,
+        };
+
+        app.move_down(2, 3, false);
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.selected, 1);
+
+        app.focus = FocusPane::Recent;
+        app.move_up(2, 3, false);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected, 0);
     }
 }

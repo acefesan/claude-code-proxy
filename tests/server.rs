@@ -237,6 +237,13 @@ async fn monitor_records_successful_request_events() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let state = monitor.snapshot();
+    assert_eq!(state.active.len(), 1);
+    assert!(state.recent.is_empty());
+
+    let _body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let state = monitor.snapshot();
     assert!(state.active.is_empty());
     assert_eq!(state.recent.len(), 1);
     assert_eq!(state.recent[0].status, RequestStatus::Completed);

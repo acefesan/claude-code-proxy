@@ -820,6 +820,20 @@ mod tests {
     }
 
     #[test]
+    fn active_stream_progress_reports_token_rate() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active.len(), 1);
+        assert!(matches!(
+            state.active[0].rate(),
+            Throughput::TokensPerSecond(_)
+        ));
+    }
+
+    #[test]
     fn late_stream_usage_updates_completed_request() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);

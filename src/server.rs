@@ -15,7 +15,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::fs::{self, File};
@@ -152,7 +152,7 @@ async fn dispatch_request(
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, endpoint);
     }
-    let _request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
     let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
@@ -432,10 +432,7 @@ async fn dispatch_request(
     );
     let status = response.status();
     if status.is_success() {
-        if let Some(monitor) = state.monitor.as_ref() {
-            monitor.request_completed(&req_id, status.as_u16(), None, None);
-        }
-        return response;
+        return monitor_response_body(response, request_guard);
     }
 
     let (response, details) = record_failed_response(
@@ -466,6 +463,26 @@ async fn dispatch_request(
         );
     }
     response
+}
+
+fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let stream =
+        futures_util::stream::unfold((body, guard), move |(mut body, mut guard)| async move {
+            match body.frame().await {
+                Some(Ok(frame)) => Some((Ok(frame), (body, guard))),
+                Some(Err(err)) => {
+                    guard.failed(status, err.to_string());
+                    Some((Err(err), (body, guard)))
+                }
+                None => {
+                    guard.completed(status);
+                    None
+                }
+            }
+        });
+    Response::from_parts(parts, Body::new(StreamBody::new(stream)))
 }
 
 struct RequestLogContext<'a> {
@@ -668,6 +685,18 @@ struct RequestMonitorGuard {
 impl RequestMonitorGuard {
     fn new(monitor: Option<MonitorHandle>, req_id: String) -> Self {
         Self { monitor, req_id }
+    }
+
+    fn completed(&mut self, status: StatusCode) {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.request_completed(&self.req_id, status.as_u16(), None, None);
+        }
+    }
+
+    fn failed(&mut self, status: StatusCode, error: String) {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.request_failed(&self.req_id, Some(status.as_u16()), error);
+        }
     }
 }
 

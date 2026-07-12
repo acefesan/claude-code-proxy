@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.1.13 (2026-07-12)
+
+- Grok users can sign in on headless hosts with `grok auth device`.
+  ([#38](https://github.com/raine/claude-code-proxy/pull/38))
+- Grok tool calls accept Claude Code's prompt-cache markers, preventing errors
+  when switching to Grok during a tool-using session.
+  ([#37](https://github.com/raine/claude-code-proxy/pull/37))
+- Codex hosted web searches return their result links and citations to Claude
+  Code instead of appearing to produce zero results.
+  ([#10](https://github.com/raine/claude-code-proxy/issues/10))
+- Codex authentication refresh is coordinated across concurrent requests and
+  automatically recovers live WebSocket requests after credentials expire.
+- Codex requests recover more reliably from temporary upstream failures,
+  connection resets, overloads, and long-running responses.
+
+## v0.1.12 (2026-07-12)
+
+- Codex hosted web searches work with GPT-5.6 models instead of failing with an
+  unsupported tool error. ([#26](https://github.com/raine/claude-code-proxy/issues/26),
+  [#35](https://github.com/raine/claude-code-proxy/pull/35))
+- Codex WebSocket connection timeouts are retried automatically, reducing
+  interrupted requests.
+
+## v0.1.11 (2026-07-11)
+
+- Grok subscriptions can power Claude Code through browser login, with support for
+  Grok 4.5 and Composer 2.5 Fast, streaming, thinking, tools, and token counts.
+- Codex WebSocket requests recover from handshake failures and stay marked active
+  until the full response body finishes streaming.
+- The monitor shows local timestamps, clearer request status and detail indicators,
+  more compact columns, arrow-key pane navigation, and an uncluttered display.
+- Forward Claude Code's `max` effort as Codex `reasoning.effort: "max"` so
+  GPT-5.6 can use its highest supported reasoning level instead of silently
+  receiving `xhigh`. ([#28](https://github.com/raine/claude-code-proxy/pull/28))
+
 ## v0.1.10 (2026-07-10)
 
 - Claude Code requests using Opus 4.8, Sonnet 5, and Fable 5 model names can
