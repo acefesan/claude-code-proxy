@@ -142,6 +142,11 @@ fn main() -> Result<()> {
                             server::ManagedRouting {
                                 coordinator: proxy_routing,
                                 anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
+                                initial_target: claude_code_proxy::routing::RouteTarget {
+                                    provider: claude_code_proxy::routing::RouteProvider::Codex,
+                                    model: std::env::var("CCP_INITIAL_MODEL")
+                                        .unwrap_or_else(|_| "gpt-5.6-sol".to_owned()),
+                                },
                             },
                             std::future::pending::<()>(),
                         ))
@@ -160,6 +165,11 @@ fn main() -> Result<()> {
                         server::ManagedRouting {
                             coordinator: proxy_routing,
                             anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
+                            initial_target: claude_code_proxy::routing::RouteTarget {
+                                provider: claude_code_proxy::routing::RouteProvider::Codex,
+                                model: std::env::var("CCP_INITIAL_MODEL")
+                                    .unwrap_or_else(|_| "gpt-5.6-sol".to_owned()),
+                            },
                         },
                         async move {
                             let _ = shutdown_rx.await;

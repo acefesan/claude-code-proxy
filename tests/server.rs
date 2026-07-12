@@ -31,6 +31,41 @@ async fn bind_error_names_address_and_port() {
 }
 
 #[tokio::test]
+async fn managed_first_request_bootstraps_uuid_session_to_initial_route() {
+    let temp = TempDir::new().unwrap();
+    let routing = RoutingCoordinator::load(temp.path().join("routing.json"), 10_000).unwrap();
+    let app = app_with_managed_routing(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        ManagedRouting {
+            coordinator: routing.clone(),
+            anthropic: AnthropicPassthrough::with_origin("http://127.0.0.1:9".to_owned()).unwrap(),
+            initial_target: RouteTarget {
+                provider: RouteProvider::Codex,
+                model: "gpt-5.6-sol".to_owned(),
+            },
+        },
+    );
+    let session_id = "b841dbc3-9763-4253-be4f-8bea63654001";
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("x-claude-code-session-id", session_id)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"claude-fable-5","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let route = routing.session(session_id).unwrap();
+    assert_eq!(route.effective.provider, RouteProvider::Codex);
+    assert_eq!(route.effective.model, "gpt-5.6-sol");
+}
+
+#[tokio::test]
 async fn managed_anthropic_route_preserves_request_and_releases_after_body() {
     async fn upstream(headers: axum::http::HeaderMap, body: axum::body::Bytes) -> &'static str {
         assert_eq!(headers.get("authorization").unwrap(), "Bearer private");
@@ -68,6 +103,10 @@ async fn managed_anthropic_route_preserves_request_and_releases_after_body() {
             coordinator: routing.clone(),
             anthropic: AnthropicPassthrough::with_origin(format!("http://{upstream_address}"))
                 .unwrap(),
+            initial_target: RouteTarget {
+                provider: RouteProvider::Codex,
+                model: "gpt-5.6-sol".to_owned(),
+            },
         },
     );
     let response = app

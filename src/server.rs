@@ -5,7 +5,7 @@ use crate::{
     monitor::{EndpointKind, MonitorHandle},
     provider::RequestContext,
     registry::{Registry, normalize_incoming_model},
-    routing::{RequestAdmission, RouteProvider, RoutingCoordinator},
+    routing::{RequestAdmission, RouteProvider, RouteTarget, RoutingCoordinator},
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -90,6 +90,7 @@ pub async fn serve_listener(
 pub struct ManagedRouting {
     pub coordinator: RoutingCoordinator,
     pub anthropic: AnthropicPassthrough,
+    pub initial_target: RouteTarget,
 }
 
 pub async fn serve_listener_managed(
@@ -211,6 +212,30 @@ async fn dispatch_request(
         };
         match routing.coordinator.admit(managed_session_id) {
             Ok(admission) => Some(admission),
+            Err(crate::routing::RoutingError::UnknownSession(_))
+                if Uuid::parse_str(managed_session_id).is_ok() =>
+            {
+                if let Err(error) = routing
+                    .coordinator
+                    .ensure_session(managed_session_id, routing.initial_target.clone())
+                {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        format!("Unable to initialize session routing: {error}"),
+                    );
+                }
+                match routing.coordinator.admit(managed_session_id) {
+                    Ok(admission) => Some(admission),
+                    Err(error) => {
+                        return json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "api_error",
+                            format!("Unable to admit initialized session: {error}"),
+                        );
+                    }
+                }
+            }
             Err(error) => {
                 return json_error(
                     StatusCode::CONFLICT,
