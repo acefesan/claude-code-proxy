@@ -56,6 +56,18 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    Probe {
+        #[command(subcommand)]
+        command: ProbeGroup,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProbeGroup {
+    AnthropicSubscriptionAuth {
+        #[arg(long, default_value_t = 18766)]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,6 +147,16 @@ fn main() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Probe { command } => match command {
+            ProbeGroup::AnthropicSubscriptionAuth { port } => {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(claude_code_proxy::probe::run(
+                    claude_code_proxy::probe::ProbeConfig::production(port),
+                ))
+            }
+        },
     }
 }
 
