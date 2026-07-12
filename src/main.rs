@@ -5,10 +5,10 @@ use claude_code_proxy::{
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
-    server::{self, ServerConfig},
+    server,
     tui::{self, MonitorUiConfig},
 };
-use std::io::IsTerminal;
+use std::{io::IsTerminal, sync::Arc};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -33,6 +33,8 @@ enum Commands {
     Serve {
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long, default_value_t = 3036)]
+        dashboard_port: u16,
         #[arg(long = "no-monitor", action = ArgAction::SetTrue)]
         no_monitor: bool,
     },
@@ -88,6 +90,7 @@ fn main() -> Result<()> {
 
     let commands = cli.command.unwrap_or(Commands::Serve {
         port: None,
+        dashboard_port: 3036,
         no_monitor: false,
     });
 
@@ -96,30 +99,48 @@ fn main() -> Result<()> {
             println!("claude-code-proxy {}", VERSION);
             Ok(())
         }
-        Commands::Serve { port, no_monitor } => {
+        Commands::Serve {
+            port,
+            dashboard_port,
+            no_monitor,
+        } => {
             let effective_port = port.unwrap_or_else(config::port);
-            let registry = Registry::with_default_alias();
+            let registry = Arc::new(Registry::with_default_alias());
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
+            let proxy_listener = runtime.block_on(server::bind_proxy_listener(effective_port))?;
+            let dashboard_listener = runtime.block_on(
+                claude_code_proxy::dashboard::bind_dashboard_listener(dashboard_port),
+            )?;
+            let dashboard_registry = Arc::clone(&registry);
+            let dashboard_task = runtime.spawn(claude_code_proxy::dashboard::serve_listener(
+                dashboard_listener,
+                dashboard_registry,
+                claude_code_proxy::scanner::ScanConfig::host(),
+                std::future::pending::<()>(),
+            ));
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
-                    print_server_banner(effective_port, &registry);
+                    print_server_banner(effective_port, registry.as_ref());
+                    println!("Dashboard: http://127.0.0.1:{dashboard_port}");
                     runtime
-                        .block_on(server::serve(ServerConfig {
-                            port: effective_port,
-                            monitor: None,
-                        }))
-                        .map_err(|err| anyhow::anyhow!(err))
+                        .block_on(server::serve_listener(
+                            proxy_listener,
+                            None,
+                            std::future::pending::<()>(),
+                        ))
+                        .map_err(|err| anyhow::anyhow!(err))?;
+                    runtime.block_on(dashboard_task)??;
+                    Ok(())
                 }
                 ServeMode::Monitor => {
                     let _stderr_guard = logging::suppress_stderr();
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                    let listener = runtime.block_on(server::bind_proxy_listener(effective_port))?;
                     let server_monitor = monitor.clone();
                     let server_task = runtime.spawn(server::serve_listener(
-                        listener,
+                        proxy_listener,
                         Some(server_monitor),
                         async move {
                             let _ = shutdown_rx.await;
@@ -129,11 +150,12 @@ fn main() -> Result<()> {
                         monitor,
                         MonitorUiConfig {
                             port: effective_port,
-                            registry: &registry,
+                            registry: registry.as_ref(),
                             shutdown: Some(shutdown_tx),
                         },
                     );
                     let server_result = runtime.block_on(server_task)?;
+                    dashboard_task.abort();
                     ui_result?;
                     server_result.map_err(|err| anyhow::anyhow!(err))
                 }
