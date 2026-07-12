@@ -151,7 +151,14 @@ struct AppState {
 }
 
 async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
+    Json(json!({ "ok": true, "proof": health_proof() }))
+}
+
+fn health_proof() -> Option<String> {
+    std::env::var("CCP_HEALTH_NONCE").ok().map(|nonce| {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(nonce.as_bytes()))
+    })
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -194,15 +201,66 @@ async fn dispatch_request(
         .get("x-claude-code-session-id")
         .and_then(|value| value.to_str().ok())
         .map(std::string::ToString::to_string);
-    let routing_admission = state
-        .routing
-        .as_ref()
-        .zip(session_id.as_deref())
-        .and_then(|(routing, session_id)| routing.coordinator.admit(session_id).ok());
+    let routing_admission = if let Some(routing) = state.routing.as_ref() {
+        let Some(managed_session_id) = session_id.as_deref() else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Managed routing requires x-claude-code-session-id",
+            );
+        };
+        match routing.coordinator.admit(managed_session_id) {
+            Ok(admission) => Some(admission),
+            Err(error) => {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "invalid_request_error",
+                    format!("Session routing unavailable: {error}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
     if routing_admission
         .as_ref()
         .is_some_and(|admission| admission.target().provider == RouteProvider::Anthropic)
     {
+        let expected_model = routing_admission
+            .as_ref()
+            .expect("checked admission")
+            .target()
+            .model
+            .clone();
+        let (parts, request_body) = req.into_parts();
+        let request_bytes = match axum::body::to_bytes(request_body, 32 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Unable to read native Anthropic request: {error}"),
+                );
+            }
+        };
+        let request_model = serde_json::from_slice::<Value>(&request_bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        if request_model.as_deref() != Some(expected_model.as_str()) {
+            return json_error(
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                format!(
+                    "Native Anthropic model mismatch: effective route expects {expected_model}"
+                ),
+            );
+        }
+        let req = Request::from_parts(parts, Body::from(request_bytes));
         if let Some(monitor) = state.monitor.as_ref() {
             monitor.request_started(&req_id, session_id.clone(), None, endpoint);
             monitor.provider_selected(

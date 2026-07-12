@@ -118,6 +118,10 @@ pub async fn serve_listener(
 }
 
 pub fn app(registry: Arc<Registry>, config: DashboardConfig) -> Router {
+    assert!(
+        valid_origin(&config.allowed_origin),
+        "dashboard origin must be HTTPS or an HTTP loopback origin"
+    );
     let session_hash = config.admin_secret.as_deref().map(hash_secret);
     let state = DashboardState {
         config,
@@ -150,7 +154,13 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(json!({"ok": true}))
+    Json(json!({"ok": true, "proof": health_proof()}))
+}
+
+fn health_proof() -> Option<String> {
+    std::env::var("CCP_HEALTH_NONCE")
+        .ok()
+        .map(|nonce| hash_secret(&nonce))
 }
 
 async fn login(
@@ -167,8 +177,14 @@ async fn login(
     if !constant_time_eq(expected.as_bytes(), hash_secret(&body.secret).as_bytes()) {
         return error(StatusCode::UNAUTHORIZED, "invalid_admin_secret");
     }
-    let cookie =
-        format!("{SESSION_COOKIE}={expected}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600");
+    let secure = if state.config.allowed_origin.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{SESSION_COOKIE}={expected}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600{secure}"
+    );
     (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
 }
 
@@ -278,6 +294,22 @@ fn model_allowed(state: &DashboardState, provider: &RouteProvider, model: &str) 
             .iter()
             .any(|candidate| candidate == model),
     }
+}
+
+fn valid_origin(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
+    }
+    url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
 }
 
 fn same_origin(state: &DashboardState, headers: &HeaderMap) -> bool {
@@ -440,6 +472,15 @@ mod tests {
             app.oneshot(with_origin).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn only_https_or_loopback_http_origins_are_valid() {
+        assert!(valid_origin("https://example.tailnet.ts.net"));
+        assert!(valid_origin("http://127.0.0.1:3036"));
+        assert!(valid_origin("http://localhost:3036"));
+        assert!(!valid_origin("http://remote.example:3036"));
+        assert!(!valid_origin("not-an-origin"));
     }
 
     #[test]

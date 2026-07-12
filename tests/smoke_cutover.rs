@@ -526,7 +526,8 @@ async fn smoke_healthz_returns_ok() {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
-    assert_eq!(body, json!({"ok": true}));
+    assert_eq!(body["ok"], json!(true));
+    assert!(body.get("proof").is_some());
 }
 
 #[tokio::test]
