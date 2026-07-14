@@ -98,7 +98,15 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         let worker = job_id
             .as_deref()
             .and_then(|id| roster.pointer(&format!("/workers/{}", escape_pointer(id))));
-        if string_at_opt(worker, &["dispatch", "source"]).as_deref() == Some("spare") {
+        // Skip only *unclaimed* pre-warmed spares. When a spare worker is claimed
+        // to back a real session its roster `dispatch.source` stays "spare", so
+        // gating on source alone drops live bg sessions launched from the spare
+        // pool (e.g. `nutrition-correct-meals`). A claimed session carries a bound
+        // `sessionId` in its record; an idle spare does not.
+        let is_unclaimed_spare = string_at_opt(worker, &["dispatch", "source"]).as_deref()
+            == Some("spare")
+            && string_at(&record, &["sessionId"]).is_none();
+        if is_unclaimed_spare {
             continue;
         }
         let environment = read_environment(&proc_path.join("environ"));
@@ -409,6 +417,29 @@ mod tests {
         let result = scan_sessions(&config);
         assert!(result.sessions.is_empty());
         assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn includes_claimed_spare_backed_bg_sessions() {
+        // A spare worker that has been claimed to back a real bg session keeps
+        // dispatch.source == "spare" but gains a bound sessionId; it must be shown.
+        let (_temp, config) = fixture();
+        write_json(
+            &config.claude_dir.join("sessions/707.json"),
+            serde_json::json!({
+                "pid":707,"sessionId":"claimed","name":"nutrition-correct-meals",
+                "cwd":"/home/x/src","kind":"bg","jobId":"claimed-job"
+            }),
+        );
+        write_json(
+            &config.claude_dir.join("daemon/roster.json"),
+            serde_json::json!({"workers":{"claimed-job":{"dispatch":{"source":"spare"}}}}),
+        );
+        live(&config.proc_dir, 707, &[]);
+        let result = scan_sessions(&config);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].name, "nutrition-correct-meals");
+        assert_eq!(result.sessions[0].kind, "bg");
     }
 
     #[test]
