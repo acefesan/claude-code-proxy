@@ -251,12 +251,6 @@ async fn dispatch_request(
         .as_ref()
         .is_some_and(|admission| admission.target().provider == RouteProvider::Anthropic)
     {
-        let expected_model = routing_admission
-            .as_ref()
-            .expect("checked admission")
-            .target()
-            .model
-            .clone();
         let (parts, request_body) = req.into_parts();
         let request_bytes = match axum::body::to_bytes(request_body, 32 * 1024 * 1024).await {
             Ok(bytes) => bytes,
@@ -276,14 +270,22 @@ async fn dispatch_request(
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        if request_model.as_deref() != Some(expected_model.as_str()) {
-            return json_error(
-                StatusCode::CONFLICT,
-                "invalid_request_error",
-                format!(
-                    "Native Anthropic model mismatch: effective route expects {expected_model}"
-                ),
-            );
+        // Native Anthropic routes forward the client's request bytes unchanged to
+        // Anthropic. A single Claude Code session legitimately issues requests for
+        // several Anthropic models (main, small/fast, and subagent all differ), so
+        // we accept any recognized Anthropic-style alias rather than one pinned
+        // model. Non-Anthropic models are still rejected, so an Anthropic route can
+        // never forward traffic to another provider's model.
+        match request_model.as_deref() {
+            Some(model) if crate::registry::is_anthropic_alias(model) => {}
+            other => {
+                let seen = other.unwrap_or("(missing)");
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "invalid_request_error",
+                    format!("Native Anthropic route received non-Anthropic model: {seen}"),
+                );
+            }
         }
         let req = Request::from_parts(parts, Body::from(request_bytes));
         if let Some(monitor) = state.monitor.as_ref() {

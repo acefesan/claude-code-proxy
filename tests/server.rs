@@ -136,6 +136,119 @@ async fn managed_anthropic_route_preserves_request_and_releases_after_body() {
     upstream_task.abort();
 }
 
+// A single Claude Code session uses several Anthropic models (main sonnet plus
+// haiku for small/fast and subagents). An Anthropic route pinned to one model
+// must still forward the others rather than rejecting them, or real sessions
+// break on their first haiku request.
+#[tokio::test]
+async fn managed_anthropic_route_accepts_other_anthropic_models() {
+    async fn upstream(body: axum::body::Bytes) -> &'static str {
+        assert_eq!(
+            body,
+            axum::body::Bytes::from_static(b"{ \"model\": \"claude-haiku-4-5\" }")
+        );
+        "native-response"
+    }
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(
+            upstream_listener,
+            axum::Router::new().route("/v1/messages", axum::routing::post(upstream)),
+        )
+        .await
+        .unwrap();
+    });
+    let temp = TempDir::new().unwrap();
+    let routing = RoutingCoordinator::load(temp.path().join("routing.json"), 10_000).unwrap();
+    routing
+        .ensure_session(
+            "native-session",
+            RouteTarget {
+                provider: RouteProvider::Anthropic,
+                model: "claude-sonnet-4-6".to_owned(),
+            },
+        )
+        .unwrap();
+    let app = app_with_managed_routing(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        ManagedRouting {
+            coordinator: routing.clone(),
+            anthropic: AnthropicPassthrough::with_origin(format!("http://{upstream_address}"))
+                .unwrap(),
+            initial_target: RouteTarget {
+                provider: RouteProvider::Codex,
+                model: "gpt-5.6-sol".to_owned(),
+            },
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("x-claude-code-session-id", "native-session")
+                .header("authorization", "Bearer private")
+                .body(Body::from("{ \"model\": \"claude-haiku-4-5\" }"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body, axum::body::Bytes::from_static(b"native-response"));
+    upstream_task.abort();
+}
+
+// Provider isolation still holds: an Anthropic route must never forward a
+// non-Anthropic model to Anthropic.
+#[tokio::test]
+async fn managed_anthropic_route_rejects_non_anthropic_model() {
+    let temp = TempDir::new().unwrap();
+    let routing = RoutingCoordinator::load(temp.path().join("routing.json"), 10_000).unwrap();
+    routing
+        .ensure_session(
+            "native-session",
+            RouteTarget {
+                provider: RouteProvider::Anthropic,
+                model: "claude-sonnet-4-6".to_owned(),
+            },
+        )
+        .unwrap();
+    let app = app_with_managed_routing(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        ManagedRouting {
+            coordinator: routing.clone(),
+            anthropic: AnthropicPassthrough::with_origin("http://127.0.0.1:9".to_owned()).unwrap(),
+            initial_target: RouteTarget {
+                provider: RouteProvider::Codex,
+                model: "gpt-5.6-sol".to_owned(),
+            },
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("x-claude-code-session-id", "native-session")
+                .header("authorization", "Bearer private")
+                .body(Body::from("{ \"model\": \"gpt-5.4\" }"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        routing.session("native-session").unwrap().active_requests,
+        0
+    );
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
     let app = app(Arc::new(Registry::with_default_alias()));

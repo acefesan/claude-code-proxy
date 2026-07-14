@@ -142,11 +142,7 @@ fn main() -> Result<()> {
                             server::ManagedRouting {
                                 coordinator: proxy_routing,
                                 anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
-                                initial_target: claude_code_proxy::routing::RouteTarget {
-                                    provider: claude_code_proxy::routing::RouteProvider::Codex,
-                                    model: std::env::var("CCP_INITIAL_MODEL")
-                                        .unwrap_or_else(|_| "gpt-5.6-sol".to_owned()),
-                                },
+                                initial_target: initial_route_target(),
                             },
                             std::future::pending::<()>(),
                         ))
@@ -165,11 +161,7 @@ fn main() -> Result<()> {
                         server::ManagedRouting {
                             coordinator: proxy_routing,
                             anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
-                            initial_target: claude_code_proxy::routing::RouteTarget {
-                                provider: claude_code_proxy::routing::RouteProvider::Codex,
-                                model: std::env::var("CCP_INITIAL_MODEL")
-                                    .unwrap_or_else(|_| "gpt-5.6-sol".to_owned()),
-                            },
+                            initial_target: initial_route_target(),
                         },
                         async move {
                             let _ = shutdown_rx.await;
@@ -223,6 +215,32 @@ fn select_serve_mode(stdout_is_tty: bool, no_monitor: bool) -> ServeMode {
     } else {
         ServeMode::Plain
     }
+}
+
+/// The route a session is bootstrap-enrolled with on its first request.
+///
+/// Defaults to Codex (the upstream behavior), but `CCP_INITIAL_PROVIDER=anthropic`
+/// makes new sessions start on native Anthropic — used when the Codex subscription
+/// is unavailable so fresh sessions do not immediately fail. `CCP_INITIAL_MODEL`
+/// overrides the nominal model; for Anthropic it is only a display default because
+/// the passthrough accepts any Anthropic-style alias the client requests.
+fn initial_route_target() -> claude_code_proxy::routing::RouteTarget {
+    use claude_code_proxy::routing::{RouteProvider, RouteTarget};
+    let provider = if std::env::var("CCP_INITIAL_PROVIDER")
+        .map(|value| value.trim().eq_ignore_ascii_case("anthropic"))
+        .unwrap_or(false)
+    {
+        RouteProvider::Anthropic
+    } else {
+        RouteProvider::Codex
+    };
+    let default_model = if provider == RouteProvider::Anthropic {
+        "claude-sonnet-4-6"
+    } else {
+        "gpt-5.6-sol"
+    };
+    let model = std::env::var("CCP_INITIAL_MODEL").unwrap_or_else(|_| default_model.to_owned());
+    RouteTarget { provider, model }
 }
 
 fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
