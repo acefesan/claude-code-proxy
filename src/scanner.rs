@@ -41,11 +41,26 @@ pub enum ObservedRoute {
 pub struct ScannedSession {
     pub name: String,
     pub session_id: Option<String>,
-    pub pid: u64,
+    /// OS pid of the backing process, present only while the session is live.
+    pub pid: Option<u64>,
+    /// True when a live process backs this session; false for terminated jobs
+    /// enumerated from disk (done/stopped) that no longer have a process.
+    pub live: bool,
     pub project: String,
     pub cwd: Option<String>,
     pub kind: String,
+    /// Canonical rollup: busy|blocked|idle|stopped|done|ended|unknown.
     pub status: String,
+    /// Raw job lifecycle state, when a job record exists (busy/blocked/idle/done/stopped).
+    pub state: Option<String>,
+    /// Human-readable status line from the job record.
+    pub detail: Option<String>,
+    /// What a blocked job is waiting on (job `needs`).
+    pub needs: Option<String>,
+    /// Final result headline from a completed job (`output.result`).
+    pub result: Option<String>,
+    /// Token spend recorded on the job, when available.
+    pub tokens: Option<u64>,
     pub route: ObservedRoute,
     pub source: String,
     pub evidence: Vec<String>,
@@ -54,10 +69,24 @@ pub struct ScannedSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionCounts {
     pub total: usize,
+    pub live: usize,
     pub busy: usize,
+    pub blocked: usize,
     pub codex: usize,
     pub anthropic: usize,
     pub unknown: usize,
+}
+
+/// One session's evidence gathered across the three discovery sources, keyed by
+/// job short-id (== roster worker key == a live session record's `jobId`), or by
+/// bare sessionId/pid for jobless interactive sessions.
+#[derive(Default)]
+struct Merged {
+    job: Option<Value>,
+    worker: Option<Value>,
+    record: Option<Value>,
+    pid: Option<u64>,
+    environment: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,11 +101,42 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
     let mut warnings = Vec::new();
     let roster =
         read_json(&config.claude_dir.join("daemon/roster.json"), &mut warnings).unwrap_or_default();
-    let mut sessions = Vec::new();
-    let sessions_dir = config.claude_dir.join("sessions");
-    let files = list_json(&sessions_dir, &mut warnings);
 
-    for file in files {
+    // Merge three discovery sources by job short-id so a session shows once no
+    // matter how many places record it: the on-disk job (survives process exit),
+    // the roster worker, and the live pid-keyed session file. The prior impl keyed
+    // solely off live session files and demoted jobs to a name-join, so paused and
+    // terminated jobs — and bg sessions whose session file lagged — vanished.
+    let mut merged: BTreeMap<String, Merged> = BTreeMap::new();
+
+    // 1. Every job on disk, including terminated ones (done/stopped) that no
+    //    longer have a live process. This is the authoritative lifecycle source.
+    let jobs_dir = config.claude_dir.join("jobs");
+    for short in list_dirs(&jobs_dir, &mut warnings) {
+        let Some(state) = read_json(&jobs_dir.join(&short).join("state.json"), &mut warnings) else {
+            continue;
+        };
+        let entry = merged.entry(short.clone()).or_default();
+        entry.job = Some(state);
+        entry.worker = roster
+            .pointer(&format!("/workers/{}", escape_pointer(&short)))
+            .cloned();
+    }
+
+    // 2. Roster workers with no job dir yet (fresh dispatches, pool spares).
+    if let Some(workers) = roster.get("workers").and_then(Value::as_object) {
+        for (short, worker) in workers {
+            let entry = merged.entry(short.clone()).or_default();
+            if entry.worker.is_none() {
+                entry.worker = Some(worker.clone());
+            }
+        }
+    }
+
+    // 3. Live pid-keyed session files whose process is actually alive. These pin
+    //    the running pid and carry the process environment used for route sniffing.
+    let sessions_dir = config.claude_dir.join("sessions");
+    for file in list_json(&sessions_dir, &mut warnings) {
         let Some(record) = read_json(&file, &mut warnings) else {
             continue;
         };
@@ -87,31 +147,44 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         if !proc_path.exists() {
             continue;
         }
+        let key = string_at(&record, &["jobId"])
+            .or_else(|| string_at(&record, &["sessionId"]))
+            .unwrap_or_else(|| format!("pid:{pid}"));
+        let environment = read_environment(&proc_path.join("environ"));
+        let entry = merged.entry(key).or_default();
+        entry.pid = Some(pid);
+        entry.environment = environment;
+        entry.record = Some(record);
+    }
 
-        let job_id = string_at(&record, &["jobId"]);
-        let job = job_id.as_deref().and_then(|id| {
-            read_json(
-                &config.claude_dir.join("jobs").join(id).join("state.json"),
-                &mut warnings,
-            )
-        });
-        let worker = job_id
-            .as_deref()
-            .and_then(|id| roster.pointer(&format!("/workers/{}", escape_pointer(id))));
-        // Skip only *unclaimed* pre-warmed spares. When a spare worker is claimed
-        // to back a real session its roster `dispatch.source` stays "spare", so
-        // gating on source alone drops live bg sessions launched from the spare
-        // pool (e.g. `nutrition-correct-meals`). A claimed session carries a bound
-        // `sessionId` in its record; an idle spare does not.
-        let is_unclaimed_spare = string_at_opt(worker, &["dispatch", "source"]).as_deref()
-            == Some("spare")
-            && string_at(&record, &["sessionId"]).is_none();
-        if is_unclaimed_spare {
+    let mut sessions = Vec::new();
+    for merged in merged.into_values() {
+        let live = merged.pid.is_some();
+        let job = merged.job.as_ref();
+        let worker = merged.worker.as_ref();
+        let record = merged.record.clone().unwrap_or(Value::Null);
+
+        let session_id = string_at(&record, &["sessionId"])
+            .or_else(|| string_at_opt(job, &["sessionId"]))
+            .or_else(|| string_at_opt(worker, &["sessionId"]));
+
+        // Skip only *unclaimed* pre-warmed spares: a spare worker with no bound
+        // session identity and no job/live backing is just pool capacity. A spare
+        // claimed to back a real bg session keeps source=="spare" but gains a
+        // sessionId (or a job/live process), so it is kept.
+        let is_spare =
+            string_at_opt(worker, &["dispatch", "source"]).as_deref() == Some("spare");
+        if is_spare && session_id.is_none() && job.is_none() {
             continue;
         }
-        let environment = read_environment(&proc_path.join("environ"));
-        let evidence = routing_evidence(environment.as_ref(), job.as_ref(), worker);
-        let has_metadata = environment.is_some() || job.is_some() || worker.is_some();
+        // Nothing durable to show: no job on disk and no live process. (A stale
+        // session file for a dead pid, or a worker slot with no job, lands here.)
+        if job.is_none() && !live {
+            continue;
+        }
+
+        let evidence = routing_evidence(merged.environment.as_ref(), job, worker);
+        let has_metadata = merged.environment.is_some() || job.is_some() || worker.is_some();
         let route = if !evidence.is_empty() {
             ObservedRoute::Codex
         } else if has_metadata {
@@ -119,22 +192,40 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         } else {
             ObservedRoute::Unknown
         };
-        let name = string_at_opt(job.as_ref(), &["name"])
+
+        let name = string_at_opt(job, &["name"])
             .or_else(|| string_at(&record, &["name"]))
             .or_else(|| string_at_opt(worker, &["dispatch", "seed", "name"]))
             .unwrap_or_else(|| "(unnamed)".to_owned());
         let cwd = string_at(&record, &["cwd"])
-            .or_else(|| string_at_opt(job.as_ref(), &["cwd"]))
+            .or_else(|| string_at_opt(job, &["cwd"]))
             .or_else(|| string_at_opt(worker, &["cwd"]));
-        let kind = string_at(&record, &["kind"]).unwrap_or_else(|| "unknown".to_owned());
-        let status = string_at(&record, &["status"]).unwrap_or_else(|| "unknown".to_owned());
-        let source = string_at_opt(worker, &["dispatch", "source"]).unwrap_or_else(|| {
-            if kind == "interactive" {
-                "cli".to_owned()
-            } else {
-                "unknown".to_owned()
-            }
-        });
+        let kind = string_at(&record, &["kind"])
+            .or_else(|| string_at_opt(job, &["template"]).map(normalize_kind))
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        let state = string_at_opt(job, &["state"]);
+        let tempo = string_at_opt(job, &["tempo"]);
+        let detail = string_at_opt(job, &["detail"]);
+        let needs = string_at_opt(job, &["needs"]);
+        let result = string_at_opt(job, &["output", "result"]);
+        let tokens = job.and_then(|job| job.get("tokens")).and_then(Value::as_u64);
+        let status = canonical_status(
+            live,
+            tempo.as_deref(),
+            state.as_deref(),
+            string_at(&record, &["status"]).as_deref(),
+        );
+
+        let source = string_at_opt(worker, &["dispatch", "source"])
+            .or_else(|| string_at_opt(job, &["template"]).map(normalize_kind))
+            .unwrap_or_else(|| {
+                if kind == "interactive" {
+                    "cli".to_owned()
+                } else {
+                    "unknown".to_owned()
+                }
+            });
         let fallback_evidence = match route {
             ObservedRoute::Anthropic => Some("no Codex routing marker"),
             ObservedRoute::Unknown => Some("insufficient metadata"),
@@ -142,14 +233,18 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         };
         sessions.push(ScannedSession {
             name,
-            session_id: string_at(&record, &["sessionId"])
-                .or_else(|| string_at_opt(job.as_ref(), &["sessionId"]))
-                .or_else(|| string_at_opt(worker, &["sessionId"])),
-            pid,
+            session_id,
+            pid: merged.pid,
+            live,
             project: project_name(cwd.as_deref()),
             cwd,
             kind,
             status,
+            state,
+            detail,
+            needs,
+            result,
+            tokens,
             route,
             source,
             evidence: if evidence.is_empty() {
@@ -165,25 +260,28 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
     }
 
     sessions.sort_by(|a, b| {
-        let a_busy = a.status == "busy";
-        let b_busy = b.status == "busy";
-        b_busy
-            .cmp(&a_busy)
+        status_rank(&a.status)
+            .cmp(&status_rank(&b.status))
             .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.pid.cmp(&b.pid))
+            .then_with(|| a.session_id.cmp(&b.session_id))
     });
     let mut counts = SessionCounts {
         total: sessions.len(),
         ..SessionCounts::default()
     };
     for session in &sessions {
+        if session.live {
+            counts.live += 1;
+        }
         match session.route {
             ObservedRoute::Codex => counts.codex += 1,
             ObservedRoute::Anthropic => counts.anthropic += 1,
             ObservedRoute::Unknown => counts.unknown += 1,
         }
-        if session.status == "busy" {
-            counts.busy += 1;
+        match session.status.as_str() {
+            "busy" => counts.busy += 1,
+            "blocked" => counts.blocked += 1,
+            _ => {}
         }
     }
     ScanResult {
@@ -191,6 +289,55 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         counts,
         sessions,
         warnings,
+    }
+}
+
+/// Rollup a job's raw lifecycle signals into one canonical status. Live sessions
+/// prefer their momentary `tempo`, then job `state`, then the session file status;
+/// terminated jobs report their final `state`.
+fn canonical_status(
+    live: bool,
+    tempo: Option<&str>,
+    state: Option<&str>,
+    record_status: Option<&str>,
+) -> String {
+    let raw = if live {
+        tempo.or(state).or(record_status).unwrap_or("idle")
+    } else {
+        state.unwrap_or("ended")
+    };
+    match raw {
+        "busy" | "running" | "active" => "busy",
+        "blocked" | "waiting" | "needs_input" | "paused" => "blocked",
+        "idle" | "ready" => "idle",
+        "stopped" | "cancelled" | "canceled" | "killed" => "stopped",
+        "done" | "completed" | "complete" | "finished" | "succeeded" => "done",
+        "ended" | "dead" | "exited" => "ended",
+        _ if live => "idle",
+        _ => "ended",
+    }
+    .to_owned()
+}
+
+/// Sort order for the dashboard: things needing attention first, then quiet,
+/// then terminated.
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "busy" => 0,
+        "blocked" => 1,
+        "idle" => 2,
+        "stopped" => 3,
+        "done" => 4,
+        "ended" => 5,
+        _ => 6,
+    }
+}
+
+/// Normalize a job `template` value into the same vocabulary as session `kind`.
+fn normalize_kind(template: String) -> String {
+    match template.as_str() {
+        "claude" => "interactive".to_owned(),
+        _ => template,
     }
 }
 
@@ -217,6 +364,21 @@ fn list_json(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            warnings.push(format!("{}: {error}", dir.display()));
+            Vec::new()
+        }
+    }
+}
+
+fn list_dirs(dir: &Path, warnings: &mut Vec<String>) -> Vec<String> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .filter_map(|entry| entry.file_name().into_string().ok())
             .collect(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
@@ -440,6 +602,64 @@ mod tests {
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].name, "nutrition-correct-meals");
         assert_eq!(result.sessions[0].kind, "bg");
+    }
+
+    #[test]
+    fn includes_terminated_jobs_from_disk() {
+        // A finished bg job leaves no live process but keeps its state.json; the
+        // dashboard must still list it with its final result and token spend.
+        let (_temp, config) = fixture();
+        write_json(
+            &config.claude_dir.join("jobs/deadbeef/state.json"),
+            serde_json::json!({
+                "name":"habit-tracker","state":"done","sessionId":"done-sess",
+                "cwd":"/home/x/habit","template":"bg","tokens":1234,
+                "output":{"result":"shipped the fix"}
+            }),
+        );
+        let result = scan_sessions(&config);
+        assert_eq!(result.sessions.len(), 1);
+        let session = &result.sessions[0];
+        assert_eq!(session.name, "habit-tracker");
+        assert_eq!(session.status, "done");
+        assert!(!session.live);
+        assert_eq!(session.pid, None);
+        assert_eq!(session.kind, "bg");
+        assert_eq!(session.result.as_deref(), Some("shipped the fix"));
+        assert_eq!(session.tokens, Some(1234));
+        assert_eq!(result.counts.live, 0);
+    }
+
+    #[test]
+    fn surfaces_blocked_needs_and_merges_job_with_live_session() {
+        // A live bg job blocked on user input: the job carries the lifecycle and
+        // the pid-keyed session file carries the process; they merge on jobId into
+        // a single blocked session that reports what it needs.
+        let (_temp, config) = fixture();
+        write_json(
+            &config.claude_dir.join("jobs/abc123/state.json"),
+            serde_json::json!({
+                "name":"nutrition-correct-meals","state":"blocked","tempo":"blocked",
+                "needs":"confirm volume drunk","sessionId":"s1","cwd":"/home/x/nut","template":"bg"
+            }),
+        );
+        write_json(
+            &config.claude_dir.join("sessions/808.json"),
+            serde_json::json!({
+                "pid":808,"sessionId":"s1","jobId":"abc123","kind":"bg",
+                "name":"nutrition-correct-meals","cwd":"/home/x/nut"
+            }),
+        );
+        live(&config.proc_dir, 808, &[]);
+        let result = scan_sessions(&config);
+        assert_eq!(result.sessions.len(), 1);
+        let session = &result.sessions[0];
+        assert_eq!(session.status, "blocked");
+        assert!(session.live);
+        assert_eq!(session.pid, Some(808));
+        assert_eq!(session.needs.as_deref(), Some("confirm volume drunk"));
+        assert_eq!(result.counts.blocked, 1);
+        assert_eq!(result.counts.live, 1);
     }
 
     #[test]

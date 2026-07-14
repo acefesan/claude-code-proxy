@@ -205,7 +205,11 @@ fn enrich_sessions(
 ) -> Result<SessionsView, RoutingError> {
     let mut views = Vec::with_capacity(result.sessions.len());
     for observed in result.sessions {
-        let routing = if let Some(session_id) = observed.session_id.as_deref() {
+        // Only live sessions get routing state. A terminated job still carries a
+        // session_id, but creating routing state for a dead session would leave
+        // phantom entries the user can never act on.
+        let routing = if let (true, Some(session_id)) = (observed.live, observed.session_id.as_deref())
+        {
             let initial = initial_target(&observed.route);
             state.config.routing.ensure_session(session_id, initial)?;
             Some(
