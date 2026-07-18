@@ -107,6 +107,10 @@ impl Registry {
         self.handlers.get(name).cloned()
     }
 
+    pub fn concrete_models_for(&self, provider: &str) -> Vec<String> {
+        self.models.get(provider).cloned().unwrap_or_default()
+    }
+
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
         let mut models = self.models.get(provider).cloned().unwrap_or_default();
         if provider == self.alias_provider.as_str() {

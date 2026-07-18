@@ -61,6 +61,8 @@ pub struct ScannedSession {
     pub result: Option<String>,
     /// Token spend recorded on the job, when available.
     pub tokens: Option<u64>,
+    /// True when the session was launched against this gateway.
+    pub managed: bool,
     pub route: ObservedRoute,
     pub source: String,
     pub evidence: Vec<String>,
@@ -113,7 +115,8 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
     //    longer have a live process. This is the authoritative lifecycle source.
     let jobs_dir = config.claude_dir.join("jobs");
     for short in list_dirs(&jobs_dir, &mut warnings) {
-        let Some(state) = read_json(&jobs_dir.join(&short).join("state.json"), &mut warnings) else {
+        let Some(state) = read_json(&jobs_dir.join(&short).join("state.json"), &mut warnings)
+        else {
             continue;
         };
         let entry = merged.entry(short.clone()).or_default();
@@ -172,8 +175,7 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         // session identity and no job/live backing is just pool capacity. A spare
         // claimed to back a real bg session keeps source=="spare" but gains a
         // sessionId (or a job/live process), so it is kept.
-        let is_spare =
-            string_at_opt(worker, &["dispatch", "source"]).as_deref() == Some("spare");
+        let is_spare = string_at_opt(worker, &["dispatch", "source"]).as_deref() == Some("spare");
         if is_spare && session_id.is_none() && job.is_none() {
             continue;
         }
@@ -184,9 +186,10 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         }
 
         let evidence = routing_evidence(merged.environment.as_ref(), job, worker);
+        let managed = !evidence.is_empty();
         let has_metadata = merged.environment.is_some() || job.is_some() || worker.is_some();
-        let route = if !evidence.is_empty() {
-            ObservedRoute::Codex
+        let route = if managed {
+            ObservedRoute::Unknown
         } else if has_metadata {
             ObservedRoute::Anthropic
         } else {
@@ -209,7 +212,9 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         let detail = string_at_opt(job, &["detail"]);
         let needs = string_at_opt(job, &["needs"]);
         let result = string_at_opt(job, &["output", "result"]);
-        let tokens = job.and_then(|job| job.get("tokens")).and_then(Value::as_u64);
+        let tokens = job
+            .and_then(|job| job.get("tokens"))
+            .and_then(Value::as_u64);
         let status = canonical_status(
             live,
             tempo.as_deref(),
@@ -245,6 +250,7 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
             needs,
             result,
             tokens,
+            managed,
             route,
             source,
             evidence: if evidence.is_empty() {
@@ -549,11 +555,11 @@ mod tests {
             result
                 .sessions
                 .iter()
-                .map(|session| (&session.name, &session.route))
+                .map(|session| (&session.name, session.managed, &session.route))
                 .collect::<Vec<_>>(),
             vec![
-                (&"shell-name".to_owned(), &ObservedRoute::Codex),
-                (&"direct".to_owned(), &ObservedRoute::Anthropic)
+                (&"shell-name".to_owned(), true, &ObservedRoute::Unknown),
+                (&"direct".to_owned(), false, &ObservedRoute::Anthropic)
             ]
         );
         assert!(!serde_json::to_string(&result).unwrap().contains("secret"));

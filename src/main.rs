@@ -119,15 +119,24 @@ fn main() -> Result<()> {
                 15_000,
             )?;
             let proxy_routing = routing.clone();
+            let initial_target = initial_route_target();
+            let allowed_origins = std::env::var("CCP_DASHBOARD_ORIGINS")
+                .or_else(|_| std::env::var("CCP_DASHBOARD_ORIGIN"))
+                .unwrap_or_else(|_| format!("http://127.0.0.1:{dashboard_port}"))
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_owned)
+                .collect();
             let dashboard_task = runtime.spawn(claude_code_proxy::dashboard::serve_listener(
                 dashboard_listener,
                 dashboard_registry,
                 claude_code_proxy::dashboard::DashboardConfig {
                     scan: claude_code_proxy::scanner::ScanConfig::host(),
                     routing,
+                    initial_target: initial_target.clone(),
                     admin_secret: std::env::var("CCP_ADMIN_SECRET").ok(),
-                    allowed_origin: std::env::var("CCP_DASHBOARD_ORIGIN")
-                        .unwrap_or_else(|_| format!("http://127.0.0.1:{dashboard_port}")),
+                    allowed_origins,
                 },
                 std::future::pending::<()>(),
             ));
@@ -142,7 +151,7 @@ fn main() -> Result<()> {
                             server::ManagedRouting {
                                 coordinator: proxy_routing,
                                 anthropic: claude_code_proxy::anthropic_passthrough::AnthropicPassthrough::production()?,
-                                initial_target: initial_route_target(),
+                                initial_target: initial_target.clone(),
                             },
                             std::future::pending::<()>(),
                         ))

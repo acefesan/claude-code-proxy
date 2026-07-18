@@ -3,7 +3,7 @@ use crate::{
     routing::{
         RouteProvider, RouteStatus, RouteTarget, RoutingCoordinator, RoutingError, SessionRoute,
     },
-    scanner::{ObservedRoute, ScanConfig, ScanResult, scan_sessions},
+    scanner::{ScanConfig, ScanResult, scan_sessions},
 };
 use axum::{
     Json, Router,
@@ -29,8 +29,9 @@ const SESSION_COOKIE: &str = "ccp_admin";
 pub struct DashboardConfig {
     pub scan: ScanConfig,
     pub routing: RoutingCoordinator,
+    pub initial_target: RouteTarget,
     pub admin_secret: Option<String>,
-    pub allowed_origin: String,
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -119,8 +120,12 @@ pub async fn serve_listener(
 
 pub fn app(registry: Arc<Registry>, config: DashboardConfig) -> Router {
     assert!(
-        valid_origin(&config.allowed_origin),
-        "dashboard origin must be HTTPS or an HTTP loopback origin"
+        !config.allowed_origins.is_empty()
+            && config
+                .allowed_origins
+                .iter()
+                .all(|origin| valid_origin(origin)),
+        "dashboard origins must be HTTPS or HTTP loopback origins"
     );
     let session_hash = config.admin_secret.as_deref().map(hash_secret);
     let state = DashboardState {
@@ -177,7 +182,7 @@ async fn login(
     if !constant_time_eq(expected.as_bytes(), hash_secret(&body.secret).as_bytes()) {
         return error(StatusCode::UNAUTHORIZED, "invalid_admin_secret");
     }
-    let secure = if state.config.allowed_origin.starts_with("https://") {
+    let secure = if request_origin(&headers).is_some_and(|origin| origin.starts_with("https://")) {
         "; Secure"
     } else {
         ""
@@ -204,21 +209,32 @@ fn enrich_sessions(
     result: ScanResult,
 ) -> Result<SessionsView, RoutingError> {
     let mut views = Vec::with_capacity(result.sessions.len());
+    let mut counts = result.counts.clone();
     for observed in result.sessions {
-        // Only live sessions get routing state. A terminated job still carries a
-        // session_id, but creating routing state for a dead session would leave
-        // phantom entries the user can never act on.
-        let routing = if let (true, Some(session_id)) = (observed.live, observed.session_id.as_deref())
-        {
-            let initial = initial_target(&observed.route);
-            state.config.routing.ensure_session(session_id, initial)?;
-            Some(
-                state
-                    .config
-                    .routing
-                    .observe_host(session_id, observed.status == "idle", result.scanned_at_ms)?
-                    .into(),
-            )
+        let routing = if let (true, true, Some(session_id)) = (
+            observed.live,
+            observed.managed,
+            observed.session_id.as_deref(),
+        ) {
+            state
+                .config
+                .routing
+                .ensure_session(session_id, state.config.initial_target.clone())?;
+            let route: RouteView = state
+                .config
+                .routing
+                .observe_host(
+                    session_id,
+                    host_quiescent(&observed.status),
+                    result.scanned_at_ms,
+                )?
+                .into();
+            counts.unknown = counts.unknown.saturating_sub(1);
+            match route.effective.provider {
+                RouteProvider::Anthropic => counts.anthropic += 1,
+                RouteProvider::Codex => counts.codex += 1,
+            }
+            Some(route)
         } else {
             None
         };
@@ -226,30 +242,30 @@ fn enrich_sessions(
     }
     Ok(SessionsView {
         scanned_at_ms: result.scanned_at_ms,
-        counts: result.counts,
+        counts,
         sessions: views,
         warnings: result.warnings,
     })
 }
 
-fn initial_target(route: &ObservedRoute) -> RouteTarget {
-    match route {
-        ObservedRoute::Anthropic => RouteTarget {
-            provider: RouteProvider::Anthropic,
-            model: "claude-fable-5".to_owned(),
-        },
-        ObservedRoute::Codex | ObservedRoute::Unknown => RouteTarget {
-            provider: RouteProvider::Codex,
-            model: "gpt-5.6-sol".to_owned(),
-        },
-    }
+fn host_quiescent(status: &str) -> bool {
+    matches!(status, "idle" | "blocked")
 }
 
 async fn providers(State(state): State<DashboardState>) -> impl IntoResponse {
-    let grouped = state.registry.grouped_models();
     Json(json!({"providers":[
-        {"id":"anthropic","available":true,"models":["claude-fable-5","claude-opus-4-8","claude-sonnet-5","claude-haiku-4-5"]},
-        {"id":"codex","available":true,"models":grouped.get("codex").cloned().unwrap_or_default()}
+        {
+            "id":"anthropic",
+            "available":true,
+            "models":["claude-fable-5"],
+            "picker_behavior":"passthrough"
+        },
+        {
+            "id":"codex",
+            "available":true,
+            "models":state.registry.concrete_models_for("codex"),
+            "picker_behavior":"override"
+        }
     ]}))
 }
 
@@ -264,6 +280,17 @@ async fn change_route(
     }
     if !authenticated(&state, &headers) {
         return error(StatusCode::UNAUTHORIZED, "admin_auth_required");
+    }
+    let managed = scan_sessions(&state.config.scan)
+        .sessions
+        .into_iter()
+        .any(|session| {
+            session.live
+                && session.managed
+                && session.session_id.as_deref() == Some(session_id.as_str())
+        });
+    if !managed {
+        return error(StatusCode::BAD_REQUEST, "session_not_proxy_managed");
     }
     if !model_allowed(&state, &body.provider, &body.model) {
         return error(StatusCode::BAD_REQUEST, "unsupported_provider_model");
@@ -294,7 +321,7 @@ fn model_allowed(state: &DashboardState, provider: &RouteProvider, model: &str) 
         .contains(&model),
         RouteProvider::Codex => state
             .registry
-            .supported_models_for("codex")
+            .concrete_models_for("codex")
             .iter()
             .any(|candidate| candidate == model),
     }
@@ -316,11 +343,18 @@ fn valid_origin(origin: &str) -> bool {
         })
 }
 
+fn request_origin(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::ORIGIN)?.to_str().ok()
+}
+
 fn same_origin(state: &DashboardState, headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|origin| origin == state.config.allowed_origin)
+    request_origin(headers).is_some_and(|origin| {
+        state
+            .config
+            .allowed_origins
+            .iter()
+            .any(|allowed| allowed == origin)
+    })
 }
 
 fn authenticated(state: &DashboardState, headers: &HeaderMap) -> bool {
@@ -406,8 +440,12 @@ mod tests {
             DashboardConfig {
                 scan,
                 routing,
+                initial_target: RouteTarget {
+                    provider: RouteProvider::Anthropic,
+                    model: "claude-fable-5".to_owned(),
+                },
                 admin_secret: Some("test-secret".to_owned()),
-                allowed_origin: "http://127.0.0.1:3036".to_owned(),
+                allowed_origins: vec!["http://127.0.0.1:3036".to_owned()],
             },
         )
     }
@@ -479,6 +517,23 @@ mod tests {
     }
 
     #[test]
+    fn blocked_and_idle_sessions_are_quiescent() {
+        assert!(host_quiescent("idle"));
+        assert!(host_quiescent("blocked"));
+        assert!(!host_quiescent("busy"));
+        assert!(!host_quiescent("unknown"));
+    }
+
+    #[test]
+    fn provider_targets_exclude_request_aliases() {
+        let registry = Registry::with_default_alias();
+        let codex = registry.concrete_models_for("codex");
+        assert!(codex.contains(&"gpt-5.6-sol".to_owned()));
+        assert!(!codex.contains(&"claude-opus-4-8".to_owned()));
+        assert!(!codex.contains(&"opus".to_owned()));
+    }
+
+    #[test]
     fn only_https_or_loopback_http_origins_are_valid() {
         assert!(valid_origin("https://example.tailnet.ts.net"));
         assert!(valid_origin("http://127.0.0.1:3036"));
@@ -491,7 +546,11 @@ mod tests {
     fn dashboard_has_accessible_provider_identity_without_route_borders() {
         assert!(APP_JS.contains("aria-label=\"Anthropic\""));
         assert!(APP_JS.contains("aria-label=\"OpenAI\""));
-        assert!(APP_JS.contains("aria-label=\"Unknown provider\""));
+        assert!(APP_JS.contains("aria-label=\"Native or unknown provider\""));
+        assert!(APP_JS.contains("Proxy managed"));
+        assert!(APP_JS.contains("Native / unmanaged"));
+        assert!(APP_JS.contains("passed through unchanged"));
+        assert!(APP_JS.contains("ignored for target selection"));
         assert!(!STYLES.contains("border-left"));
     }
 }
