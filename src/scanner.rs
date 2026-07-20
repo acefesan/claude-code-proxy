@@ -63,6 +63,11 @@ pub struct ScannedSession {
     pub tokens: Option<u64>,
     /// True when the session was launched against this gateway.
     pub managed: bool,
+    /// True when the session was launched with `--remote-control` (phone-steerable
+    /// via Anthropic's relay). Detected from the recorded launch/respawn flags.
+    pub rc: bool,
+    /// The Remote Control session name, when `--remote-control <name>` supplied one.
+    pub rc_name: Option<String>,
     pub route: ObservedRoute,
     pub source: String,
     pub evidence: Vec<String>,
@@ -221,6 +226,7 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
             state.as_deref(),
             string_at(&record, &["status"]).as_deref(),
         );
+        let (rc, rc_name) = remote_control(worker, job);
 
         let source = string_at_opt(worker, &["dispatch", "source"])
             .or_else(|| string_at_opt(job, &["template"]).map(normalize_kind))
@@ -251,6 +257,8 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
             result,
             tokens,
             managed,
+            rc,
+            rc_name,
             route,
             source,
             evidence: if evidence.is_empty() {
@@ -345,6 +353,88 @@ fn normalize_kind(template: String) -> String {
         "claude" => "interactive".to_owned(),
         _ => template,
     }
+}
+
+/// Everything needed to resume/relaunch a session with `claude`: the id to
+/// resume from, its working directory, and the flags it was dispatched with.
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchSpec {
+    /// Session id to pass to `--resume` (a terminated job resumes from its
+    /// `resumeSessionId` when present, otherwise its own id).
+    pub resume_id: String,
+    pub cwd: Option<String>,
+    /// Flags the session was dispatched with (settings, agent, permission mode).
+    pub respawn_flags: Vec<String>,
+    pub name: Option<String>,
+    /// Existing Remote Control name, if the session already carried one.
+    pub rc_name: Option<String>,
+    pub live: bool,
+}
+
+/// Resolve how to relaunch a session by its full session id, searching the live
+/// roster first (for running sessions whose rc dropped) then on-disk jobs (for
+/// terminated sessions to relaunch). Returns None if the id is unknown.
+pub fn launch_spec(config: &ScanConfig, session_id: &str) -> Option<LaunchSpec> {
+    let mut warnings = Vec::new();
+    let roster =
+        read_json(&config.claude_dir.join("daemon/roster.json"), &mut warnings).unwrap_or_default();
+
+    if let Some(workers) = roster.get("workers").and_then(Value::as_object) {
+        for worker in workers.values() {
+            let matches = string_at(worker, &["sessionId"]).as_deref() == Some(session_id)
+                || string_at_opt(Some(worker), &["dispatch", "sessionId"]).as_deref()
+                    == Some(session_id);
+            if !matches {
+                continue;
+            }
+            let live = worker
+                .get("pid")
+                .and_then(Value::as_u64)
+                .is_some_and(|pid| config.proc_dir.join(pid.to_string()).exists());
+            let (_, rc_name) = remote_control(Some(worker), None);
+            return Some(LaunchSpec {
+                resume_id: session_id.to_owned(),
+                cwd: string_at_opt(Some(worker), &["dispatch", "cwd"])
+                    .or_else(|| string_at_opt(Some(worker), &["cwd"])),
+                respawn_flags: string_array(worker.pointer("/dispatch/respawnFlags")),
+                name: string_at_opt(Some(worker), &["dispatch", "seed", "name"]),
+                rc_name,
+                live,
+            });
+        }
+    }
+
+    let jobs_dir = config.claude_dir.join("jobs");
+    for short in list_dirs(&jobs_dir, &mut warnings) {
+        let Some(job) = read_json(&jobs_dir.join(&short).join("state.json"), &mut warnings) else {
+            continue;
+        };
+        if string_at(&job, &["sessionId"]).as_deref() != Some(session_id) {
+            continue;
+        }
+        let (_, rc_name) = remote_control(None, Some(&job));
+        return Some(LaunchSpec {
+            resume_id: string_at(&job, &["resumeSessionId"]).unwrap_or_else(|| session_id.to_owned()),
+            cwd: string_at(&job, &["cwd"]),
+            respawn_flags: string_array(job.get("respawnFlags")),
+            name: string_at(&job, &["name"]),
+            rc_name,
+            live: false,
+        });
+    }
+    None
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn read_json(path: &Path, warnings: &mut Vec<String>) -> Option<Value> {
@@ -446,6 +536,34 @@ fn routing_evidence(
         evidence.insert("launch metadata: Codex provider".to_owned());
     }
     evidence.into_iter().collect()
+}
+
+/// Detect whether a session was launched with `--remote-control` (making it
+/// steerable from the phone via Anthropic's relay), and recover the optional
+/// name argument. Reads the recorded launch/respawn flag arrays — the same
+/// metadata `claude` writes for every dispatched worker and job.
+fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<String>) {
+    let sources = [
+        worker.and_then(|value| value.pointer("/dispatch/launch/args")),
+        worker.and_then(|value| value.pointer("/dispatch/respawnFlags")),
+        job.and_then(|value| value.get("respawnFlags")),
+    ];
+    for array in sources.into_iter().flatten().filter_map(Value::as_array) {
+        if let Some(index) = array
+            .iter()
+            .position(|item| item.as_str() == Some("--remote-control"))
+        {
+            // `--remote-control [name]`: the name is optional and, when present,
+            // is the next token that isn't itself a flag.
+            let name = array
+                .get(index + 1)
+                .and_then(Value::as_str)
+                .filter(|token| !token.starts_with("--"))
+                .map(str::to_owned);
+            return (true, name);
+        }
+    }
+    (false, None)
 }
 
 fn flatten(value: Option<&Value>) -> String {
@@ -666,6 +784,36 @@ mod tests {
         assert_eq!(session.needs.as_deref(), Some("confirm volume drunk"));
         assert_eq!(result.counts.blocked, 1);
         assert_eq!(result.counts.live, 1);
+    }
+
+    #[test]
+    fn detects_remote_control_and_name_from_launch_flags() {
+        // A session launched `claude --bg --remote-control <name>` records the flag
+        // in its worker launch args; the scanner must report it as rc-armed so the
+        // dashboard can distinguish phone-steerable sessions from the rest.
+        let (_temp, config) = fixture();
+        write_json(
+            &config.claude_dir.join("sessions/909.json"),
+            serde_json::json!({"pid":909,"sessionId":"rc-sess","jobId":"rc-job","kind":"bg","name":"habit-tracker","cwd":"/home/x/h"}),
+        );
+        write_json(
+            &config.claude_dir.join("daemon/roster.json"),
+            serde_json::json!({"workers":{"rc-job":{"dispatch":{"launch":{"args":["--session-id","rc-sess","--remote-control","habit-rc","--allow-dangerously-skip-permissions"]}}}}}),
+        );
+        live(&config.proc_dir, 909, &[]);
+        // A second session without the flag stays rc=false.
+        write_json(
+            &config.claude_dir.join("sessions/910.json"),
+            serde_json::json!({"pid":910,"sessionId":"plain","kind":"bg","name":"plain","cwd":"/home/x/p"}),
+        );
+        live(&config.proc_dir, 910, &[]);
+        let result = scan_sessions(&config);
+        let rc = result.sessions.iter().find(|s| s.name == "habit-tracker").unwrap();
+        assert!(rc.rc);
+        assert_eq!(rc.rc_name.as_deref(), Some("habit-rc"));
+        let plain = result.sessions.iter().find(|s| s.name == "plain").unwrap();
+        assert!(!plain.rc);
+        assert_eq!(plain.rc_name, None);
     }
 
     #[test]

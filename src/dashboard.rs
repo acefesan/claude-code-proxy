@@ -17,7 +17,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{future::Future, sync::Arc};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
 const INDEX: &str = include_str!("../assets/dashboard/index.html");
@@ -51,6 +51,14 @@ struct ChangeRouteRequest {
     provider: RouteProvider,
     model: String,
     expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RemoteControlRequest {
+    /// Optional override for the Remote Control session name. Defaults to the
+    /// session's existing rc name, then its display name.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,6 +150,10 @@ pub fn app(registry: Arc<Registry>, config: DashboardConfig) -> Router {
         .route("/api/v1/sessions", get(sessions))
         .route("/api/v1/providers", get(providers))
         .route("/api/v1/sessions/{session_id}/route", put(change_route))
+        .route(
+            "/api/v1/sessions/{session_id}/remote-control",
+            post(enable_remote_control),
+        )
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -308,6 +320,145 @@ async fn change_route(
         Err(RoutingError::UnknownSession(_)) => error(StatusCode::NOT_FOUND, "unknown_session"),
         Err(other) => error(StatusCode::BAD_REQUEST, &other.to_string()),
     }
+}
+
+/// Re-arm Remote Control on a session by resuming it with `--remote-control`.
+/// This works for any session (managed or native) because rc is orthogonal to
+/// which provider serves it. Because the `claude` CLI only enables rc at launch,
+/// re-arming necessarily resumes the session from its last transcript checkpoint
+/// — the live process (if any) is stopped first to avoid a duplicate.
+async fn enable_remote_control(
+    State(state): State<DashboardState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RemoteControlRequest>,
+) -> Response {
+    if !same_origin(&state, &headers) {
+        return error(StatusCode::FORBIDDEN, "origin_not_allowed");
+    }
+    if !authenticated(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "admin_auth_required");
+    }
+    let Some(spec) = crate::scanner::launch_spec(&state.config.scan, &session_id) else {
+        return error(StatusCode::NOT_FOUND, "unknown_session");
+    };
+    let rc_name = body
+        .name
+        .or_else(|| spec.rc_name.clone())
+        .or_else(|| spec.name.clone())
+        .map(|name| sanitize_rc_name(&name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "session".to_owned());
+    match resume_with_remote_control(&spec, &rc_name).await {
+        Ok(new_session_id) => Json(json!({
+            "ok": true,
+            "rc_name": rc_name,
+            "resumed_from": spec.resume_id,
+            "was_live": spec.live,
+            "new_session_id": new_session_id,
+        }))
+        .into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("relaunch_failed: {err}")),
+    }
+}
+
+async fn resume_with_remote_control(
+    spec: &crate::scanner::LaunchSpec,
+    rc_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let claude = claude_binary();
+    let cwd = spec.cwd.clone().unwrap_or_else(|| ".".to_owned());
+
+    // Stop the still-running process first so resuming doesn't fork a duplicate.
+    // `claude stop` takes the short id (the uuid's first segment), not the full id.
+    if spec.live {
+        let short = spec.resume_id.split('-').next().unwrap_or(&spec.resume_id);
+        let _ = tokio::process::Command::new(&claude)
+            .arg("stop")
+            .arg(short)
+            .current_dir(&cwd)
+            .output()
+            .await;
+    }
+
+    let mut args = vec![
+        "--resume".to_owned(),
+        spec.resume_id.clone(),
+        "--remote-control".to_owned(),
+        rc_name.to_owned(),
+        "--bg".to_owned(),
+    ];
+    // Carry the original dispatch flags, dropping any prior `--remote-control [name]`.
+    let mut flags = spec.respawn_flags.iter().peekable();
+    while let Some(flag) = flags.next() {
+        if flag == "--remote-control" {
+            if flags.peek().is_some_and(|next| !next.starts_with("--")) {
+                flags.next();
+            }
+            continue;
+        }
+        args.push(flag.clone());
+    }
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(25),
+        tokio::process::Command::new(&claude)
+            .args(&args)
+            .current_dir(&cwd)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("claude did not return within 25s"))??;
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    // `claude --bg` prints "backgrounded · <shortid>" on success.
+    let new_session_id = combined
+        .split("backgrounded")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_hexdigit())
+                .find(|token| token.len() >= 6)
+                .map(str::to_owned)
+        });
+    if !output.status.success() && new_session_id.is_none() {
+        anyhow::bail!("claude exited with {}: {}", output.status, combined.trim());
+    }
+    Ok(new_session_id)
+}
+
+/// Locate the `claude` binary: an explicit `CLAUDE_BIN`, else the standard
+/// user-local install, else rely on PATH.
+fn claude_binary() -> std::path::PathBuf {
+    if let Some(bin) = std::env::var_os("CLAUDE_BIN") {
+        return bin.into();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = std::path::Path::new(&home).join(".local/bin/claude");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    "claude".into()
+}
+
+/// Reduce a display name to a safe Remote Control name (alphanumerics, dash,
+/// underscore; capped length). Passed as an argv element, so this is defensive,
+/// not a shell-injection guard.
+fn sanitize_rc_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(60)
+        .collect()
 }
 
 fn model_allowed(state: &DashboardState, provider: &RouteProvider, model: &str) -> bool {
