@@ -548,7 +548,12 @@ fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<
         worker.and_then(|value| value.pointer("/dispatch/respawnFlags")),
         job.and_then(|value| value.get("respawnFlags")),
     ];
-    for array in sources.into_iter().flatten().filter_map(Value::as_array) {
+    let arrays: Vec<&Vec<Value>> = sources
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .collect();
+    for array in &arrays {
         if let Some(index) = array
             .iter()
             .position(|item| item.as_str() == Some("--remote-control"))
@@ -563,7 +568,32 @@ fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<
             return (true, name);
         }
     }
+    // Default-on path: no explicit flag, but the session's `--settings <file>`
+    // may set `remoteControlAtStartup: true`, which arms rc for every session
+    // using that file. Read the referenced settings to catch that case.
+    for array in &arrays {
+        if let Some(index) = array
+            .iter()
+            .position(|item| item.as_str() == Some("--settings"))
+        {
+            if let Some(path) = array.get(index + 1).and_then(Value::as_str) {
+                if settings_arms_remote_control(path) {
+                    return (true, None);
+                }
+            }
+        }
+    }
     (false, None)
+}
+
+/// True when a `--settings` file sets `remoteControlAtStartup: true` — the
+/// default-on lever that arms Remote Control without an explicit launch flag.
+fn settings_arms_remote_control(path: &str) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("remoteControlAtStartup").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn flatten(value: Option<&Value>) -> String {
@@ -814,6 +844,27 @@ mod tests {
         let plain = result.sessions.iter().find(|s| s.name == "plain").unwrap();
         assert!(!plain.rc);
         assert_eq!(plain.rc_name, None);
+    }
+
+    #[test]
+    fn detects_remote_control_from_settings_default() {
+        // Default-on: a session launched `--settings <file>` where the file sets
+        // remoteControlAtStartup:true is rc-armed even without an explicit flag.
+        let (_temp, config) = fixture();
+        let settings = config.claude_dir.join("codex-settings.json");
+        write_json(&settings, serde_json::json!({"remoteControlAtStartup": true}));
+        write_json(
+            &config.claude_dir.join("sessions/911.json"),
+            serde_json::json!({"pid":911,"sessionId":"def-rc","jobId":"def-job","kind":"bg","name":"defaulted","cwd":"/home/x/d"}),
+        );
+        write_json(
+            &config.claude_dir.join("daemon/roster.json"),
+            serde_json::json!({"workers":{"def-job":{"dispatch":{"launch":{"args":["--settings",settings.to_str().unwrap(),"--agent","claude"]}}}}}),
+        );
+        live(&config.proc_dir, 911, &[]);
+        let result = scan_sessions(&config);
+        let session = result.sessions.iter().find(|s| s.name == "defaulted").unwrap();
+        assert!(session.rc, "settings-based remoteControlAtStartup must arm rc");
     }
 
     #[test]
