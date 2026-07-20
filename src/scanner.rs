@@ -903,7 +903,7 @@ mod tests {
         let result = scan_sessions(&config);
         assert_eq!(
             result.sessions[0].name,
-            "Migrate the nutrition catalog to versioned macr…"
+            "Migrate the nutrition catalog to versioned macro…"
         );
         assert_eq!(summarize(""), None);
         assert_eq!(summarize("  \n x"), Some("x".to_owned()));
