@@ -570,14 +570,19 @@ fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<
     }
     // Default-on path: no explicit flag, but the session's `--settings <file>`
     // may set `remoteControlAtStartup: true`, which arms rc for every session
-    // using that file. Read the referenced settings to catch that case.
+    // using that file. Read the referenced settings to catch that case — but
+    // only trust it for sessions that launched *after* the setting was written,
+    // since rc is decided at launch, not at scan time.
+    let started_at = worker
+        .and_then(|worker| worker.get("startedAt"))
+        .and_then(Value::as_u64);
     for array in &arrays {
         if let Some(index) = array
             .iter()
             .position(|item| item.as_str() == Some("--settings"))
         {
             if let Some(path) = array.get(index + 1).and_then(Value::as_str) {
-                if settings_arms_remote_control(path) {
+                if settings_arms_remote_control(path, started_at) {
                     return (true, None);
                 }
             }
@@ -586,14 +591,34 @@ fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<
     (false, None)
 }
 
-/// True when a `--settings` file sets `remoteControlAtStartup: true` — the
-/// default-on lever that arms Remote Control without an explicit launch flag.
-fn settings_arms_remote_control(path: &str) -> bool {
-    fs::read(path)
+/// True when a `--settings` file sets `remoteControlAtStartup: true` *and* the
+/// setting predates the session's launch. Without a launch time we cannot
+/// confirm the session actually started with rc, so we conservatively say no —
+/// a false "rc off" merely prompts a harmless re-arm, whereas a false "rc on"
+/// would hide a session that silently dropped Remote Control.
+fn settings_arms_remote_control(path: &str, started_at_ms: Option<u64>) -> bool {
+    let armed = fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("remoteControlAtStartup").and_then(Value::as_bool))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !armed {
+        return false;
+    }
+    match (started_at_ms, file_mtime_ms(path)) {
+        (Some(started), Some(mtime)) => mtime <= started,
+        _ => false,
+    }
+}
+
+fn file_mtime_ms(path: &str) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_millis() as u64)
 }
 
 fn flatten(value: Option<&Value>) -> String {
@@ -857,14 +882,33 @@ mod tests {
             &config.claude_dir.join("sessions/911.json"),
             serde_json::json!({"pid":911,"sessionId":"def-rc","jobId":"def-job","kind":"bg","name":"defaulted","cwd":"/home/x/d"}),
         );
+        // startedAt after the settings file mtime → the session launched with rc on.
+        let started_after = now_ms() + 60_000;
         write_json(
             &config.claude_dir.join("daemon/roster.json"),
-            serde_json::json!({"workers":{"def-job":{"dispatch":{"launch":{"args":["--settings",settings.to_str().unwrap(),"--agent","claude"]}}}}}),
+            serde_json::json!({"workers":{"def-job":{"startedAt":started_after,"dispatch":{"launch":{"args":["--settings",settings.to_str().unwrap(),"--agent","claude"]}}}}}),
         );
         live(&config.proc_dir, 911, &[]);
         let result = scan_sessions(&config);
         let session = result.sessions.iter().find(|s| s.name == "defaulted").unwrap();
         assert!(session.rc, "settings-based remoteControlAtStartup must arm rc");
+
+        // A session that started *before* the setting was written is not armed.
+        write_json(
+            &config.claude_dir.join("sessions/912.json"),
+            serde_json::json!({"pid":912,"sessionId":"old-rc","jobId":"old-job","kind":"bg","name":"predates","cwd":"/home/x/o"}),
+        );
+        write_json(
+            &config.claude_dir.join("daemon/roster.json"),
+            serde_json::json!({"workers":{
+                "def-job":{"startedAt":started_after,"dispatch":{"launch":{"args":["--settings",settings.to_str().unwrap(),"--agent","claude"]}}},
+                "old-job":{"startedAt":1u64,"dispatch":{"launch":{"args":["--settings",settings.to_str().unwrap(),"--agent","claude"]}}}
+            }}),
+        );
+        live(&config.proc_dir, 912, &[]);
+        let result = scan_sessions(&config);
+        let old = result.sessions.iter().find(|s| s.name == "predates").unwrap();
+        assert!(!old.rc, "a session predating the setting must not be reported rc-armed");
     }
 
     #[test]
