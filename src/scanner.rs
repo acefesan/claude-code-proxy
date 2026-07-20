@@ -906,7 +906,8 @@ mod tests {
             "Migrate the nutrition catalog to versioned macro…"
         );
         assert_eq!(summarize(""), None);
-        assert_eq!(summarize("  \n x"), Some("x".to_owned()));
+        assert_eq!(summarize("   "), None);
+        assert_eq!(summarize("  hello  \nsecond line"), Some("hello".to_owned()));
     }
 
     #[test]
