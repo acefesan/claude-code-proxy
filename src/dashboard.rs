@@ -32,6 +32,11 @@ pub struct DashboardConfig {
     pub initial_target: RouteTarget,
     pub admin_secret: Option<String>,
     pub allowed_origins: Vec<String>,
+    /// When true, skip the admin-cookie check on mutating endpoints and trust the
+    /// network boundary instead (loopback bind + Tailscale tailnet-only serve).
+    /// The same-origin check still applies as CSRF protection. Intended for a
+    /// single-user tailnet where the admin secret is redundant friction.
+    pub trust_local_network: bool,
 }
 
 #[derive(Clone)]
@@ -509,6 +514,12 @@ fn same_origin(state: &DashboardState, headers: &HeaderMap) -> bool {
 }
 
 fn authenticated(state: &DashboardState, headers: &HeaderMap) -> bool {
+    // Trusted-network mode: the caller already cleared same-origin, and the
+    // dashboard is reachable only over loopback + the tailnet, so skip the
+    // admin-cookie factor entirely.
+    if state.config.trust_local_network {
+        return true;
+    }
     let Some(expected) = state.session_hash.as_deref() else {
         return false;
     };
@@ -597,6 +608,7 @@ mod tests {
                 },
                 admin_secret: Some("test-secret".to_owned()),
                 allowed_origins: vec!["http://127.0.0.1:3036".to_owned()],
+                trust_local_network: false,
             },
         )
     }
@@ -664,6 +676,38 @@ mod tests {
         assert_eq!(
             app.oneshot(with_origin).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_local_network_bypasses_admin_but_keeps_same_origin() {
+        let (_temp, mut config) = fixture();
+        config.trust_local_network = true;
+        let app = app(Arc::new(Registry::with_default_alias()), config);
+        let request = || {
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/sessions/session/route")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"provider":"anthropic","model":"claude-fable-5","expected_revision":0}"#,
+                ))
+                .unwrap()
+        };
+        // Same-origin is still enforced even in trusted mode.
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        // With a valid origin and NO admin cookie, auth is bypassed: the request
+        // gets past the 401 gate and fails later on the managed-session check.
+        let mut with_origin = request();
+        with_origin
+            .headers_mut()
+            .insert(header::ORIGIN, "http://127.0.0.1:3036".parse().unwrap());
+        assert_eq!(
+            app.oneshot(with_origin).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
         );
     }
 

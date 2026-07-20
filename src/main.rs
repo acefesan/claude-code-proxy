@@ -137,6 +137,11 @@ fn main() -> Result<()> {
                     initial_target: initial_target.clone(),
                     admin_secret: std::env::var("CCP_ADMIN_SECRET").ok(),
                     allowed_origins,
+                    trust_local_network: std::env::var("CCP_DASHBOARD_TRUST_LOCAL")
+                        .is_ok_and(|value| {
+                            let value = value.trim();
+                            value == "1" || value.eq_ignore_ascii_case("true")
+                        }),
                 },
                 std::future::pending::<()>(),
             ));
