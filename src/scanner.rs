@@ -204,6 +204,10 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
         let name = string_at_opt(job, &["name"])
             .or_else(|| string_at(&record, &["name"]))
             .or_else(|| string_at_opt(worker, &["dispatch", "seed", "name"]))
+            // Unnamed sessions (e.g. `claude --bg "<task>"` with no name) fall back
+            // to the job's intent — the task prompt — so they stay identifiable
+            // instead of collapsing to an indistinguishable "(unnamed)".
+            .or_else(|| string_at_opt(job, &["intent"]).and_then(|intent| summarize(&intent)))
             .unwrap_or_else(|| "(unnamed)".to_owned());
         let cwd = string_at(&record, &["cwd"])
             .or_else(|| string_at_opt(job, &["cwd"]))
@@ -423,6 +427,21 @@ pub fn launch_spec(config: &ScanConfig, session_id: &str) -> Option<LaunchSpec> 
         });
     }
     None
+}
+
+/// Reduce a free-text intent/prompt to a short one-line label (first line,
+/// trimmed, ellipsized). Returns None when there's nothing usable.
+fn summarize(text: &str) -> Option<String> {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return None;
+    }
+    let truncated: String = line.chars().take(48).collect();
+    Some(if line.chars().count() > 48 {
+        format!("{}…", truncated.trim_end())
+    } else {
+        truncated
+    })
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
@@ -869,6 +888,25 @@ mod tests {
         let plain = result.sessions.iter().find(|s| s.name == "plain").unwrap();
         assert!(!plain.rc);
         assert_eq!(plain.rc_name, None);
+    }
+
+    #[test]
+    fn unnamed_session_falls_back_to_intent_summary() {
+        let (_temp, config) = fixture();
+        write_json(
+            &config.claude_dir.join("jobs/nameless/state.json"),
+            serde_json::json!({
+                "state":"done","sessionId":"n1","cwd":"/home/x/n","template":"bg",
+                "intent":"Migrate the nutrition catalog to versioned macros\nand backfill"
+            }),
+        );
+        let result = scan_sessions(&config);
+        assert_eq!(
+            result.sessions[0].name,
+            "Migrate the nutrition catalog to versioned macr…"
+        );
+        assert_eq!(summarize(""), None);
+        assert_eq!(summarize("  \n x"), Some("x".to_owned()));
     }
 
     #[test]
