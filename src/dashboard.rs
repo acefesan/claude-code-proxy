@@ -37,6 +37,10 @@ pub struct DashboardConfig {
     /// The same-origin check still applies as CSRF protection. Intended for a
     /// single-user tailnet where the admin secret is redundant friction.
     pub trust_local_network: bool,
+    /// Path to the `--settings` file that puts a session in gateway/proxy mode
+    /// (sets `ANTHROPIC_BASE_URL` to the local proxy). Used when switching a
+    /// session into proxy mode. None disables switching *into* proxy mode.
+    pub proxy_settings_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -56,6 +60,35 @@ struct ChangeRouteRequest {
     provider: RouteProvider,
     model: String,
     expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModeRequest {
+    /// "native-rc" (first-party + Remote Control) or "proxy" (gateway-routed).
+    mode: String,
+    /// When true, return the exact relaunch plan without executing anything —
+    /// the no-traffic smoke test.
+    #[serde(default)]
+    dry_run: bool,
+    /// Optional Remote Control name override (native-rc mode).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The exact, side-effect-free relaunch plan for a mode switch. Serialized back
+/// on a dry run so the whole switch can be inspected without spawning `claude`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ModePlan {
+    mode: String,
+    resume_id: String,
+    cwd: Option<String>,
+    binary: String,
+    argv: Vec<String>,
+    /// Environment variables the child must NOT inherit (gateway leftovers that
+    /// would otherwise trip the RC gate or mislabel the mode).
+    env_unset: Vec<String>,
+    /// The live process to stop first (its short id), if any.
+    stop_short_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -159,6 +192,7 @@ pub fn app(registry: Arc<Registry>, config: DashboardConfig) -> Router {
             "/api/v1/sessions/{session_id}/remote-control",
             post(enable_remote_control),
         )
+        .route("/api/v1/sessions/{session_id}/mode", post(switch_mode))
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -365,6 +399,161 @@ async fn enable_remote_control(
         .into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("relaunch_failed: {err}")),
     }
+}
+
+/// Switch a bg session between routing modes by pausing and resuming its
+/// transcript in the target mode. `native-rc` = first-party + Remote Control
+/// (phone-steerable); `proxy` = gateway-routed (Codex). The transcript carries
+/// across; only in-flight work since the last checkpoint is lost. `dry_run`
+/// returns the exact plan without touching anything.
+async fn switch_mode(
+    State(state): State<DashboardState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ModeRequest>,
+) -> Response {
+    if !same_origin(&state, &headers) {
+        return error(StatusCode::FORBIDDEN, "origin_not_allowed");
+    }
+    if !authenticated(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "admin_auth_required");
+    }
+    let Some(spec) = crate::scanner::launch_spec(&state.config.scan, &session_id) else {
+        return error(StatusCode::NOT_FOUND, "unknown_session");
+    };
+    let rc_name = body
+        .name
+        .or_else(|| spec.rc_name.clone())
+        .or_else(|| spec.name.clone())
+        .map(|name| sanitize_rc_name(&name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "session".to_owned());
+    let binary = claude_binary().to_string_lossy().into_owned();
+    let plan = match mode_plan(
+        &spec,
+        &body.mode,
+        &rc_name,
+        state.config.proxy_settings_path.as_deref(),
+        &binary,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => return error(StatusCode::BAD_REQUEST, &err),
+    };
+    if body.dry_run {
+        return Json(json!({ "dry_run": true, "plan": plan })).into_response();
+    }
+    match execute_mode_plan(&plan).await {
+        Ok(new_session_id) => Json(json!({
+            "ok": true,
+            "mode": plan.mode,
+            "resumed_from": plan.resume_id,
+            "new_session_id": new_session_id,
+        }))
+        .into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("switch_failed: {err}")),
+    }
+}
+
+/// Build the relaunch plan for a mode switch. Pure — no I/O, no spawning — so it
+/// is fully unit-testable and safe to expose as a dry run.
+fn mode_plan(
+    spec: &crate::scanner::LaunchSpec,
+    mode: &str,
+    rc_name: &str,
+    proxy_settings: Option<&str>,
+    binary: &str,
+) -> Result<ModePlan, String> {
+    // Keep the session's own flags, minus the ones each mode owns and re-adds.
+    let preserved = strip_flags(&spec.respawn_flags, &["--remote-control", "--settings"]);
+    let mut argv = vec![
+        "--resume".to_owned(),
+        spec.resume_id.clone(),
+        "--bg".to_owned(),
+    ];
+    let env_unset = match mode {
+        "native-rc" => {
+            argv.push("--remote-control".to_owned());
+            argv.push(rc_name.to_owned());
+            // Native must be first-party direct to Anthropic: strip any gateway
+            // env the launcher would otherwise inherit and that trips the RC gate.
+            vec![
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "CCP_ALIAS_PROVIDER".to_owned(),
+                "ANTHROPIC_UNIX_SOCKET".to_owned(),
+            ]
+        }
+        "proxy" => {
+            let settings =
+                proxy_settings.ok_or_else(|| "proxy_settings_not_configured".to_owned())?;
+            argv.push("--settings".to_owned());
+            argv.push(settings.to_owned());
+            Vec::new()
+        }
+        other => return Err(format!("unknown_mode: {other}")),
+    };
+    argv.extend(preserved);
+    Ok(ModePlan {
+        mode: mode.to_owned(),
+        resume_id: spec.resume_id.clone(),
+        cwd: spec.cwd.clone(),
+        binary: binary.to_owned(),
+        argv,
+        env_unset,
+        stop_short_id: spec.live.then(|| {
+            spec.resume_id
+                .split('-')
+                .next()
+                .unwrap_or(&spec.resume_id)
+                .to_owned()
+        }),
+    })
+}
+
+/// Drop `strip` flags (and any following value token) from a flag list.
+fn strip_flags(flags: &[String], strip: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = flags.iter().peekable();
+    while let Some(flag) = iter.next() {
+        if strip.contains(&flag.as_str()) {
+            if iter.peek().is_some_and(|next| !next.starts_with("--")) {
+                iter.next();
+            }
+            continue;
+        }
+        out.push(flag.clone());
+    }
+    out
+}
+
+async fn execute_mode_plan(plan: &ModePlan) -> anyhow::Result<Option<String>> {
+    let cwd = plan.cwd.clone().unwrap_or_else(|| ".".to_owned());
+    if let Some(short) = &plan.stop_short_id {
+        let _ = tokio::process::Command::new(&plan.binary)
+            .arg("stop")
+            .arg(short)
+            .current_dir(&cwd)
+            .output()
+            .await;
+    }
+    let mut command = tokio::process::Command::new(&plan.binary);
+    command.args(&plan.argv).current_dir(&cwd);
+    for key in &plan.env_unset {
+        command.env_remove(key);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(25), command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("claude did not return within 25s"))??;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let new_session_id = combined.split("backgrounded").nth(1).and_then(|rest| {
+        rest.split(|c: char| !c.is_ascii_hexdigit())
+            .find(|token| token.len() >= 6)
+            .map(str::to_owned)
+    });
+    if !output.status.success() && new_session_id.is_none() {
+        anyhow::bail!("claude exited with {}: {}", output.status, combined.trim());
+    }
+    Ok(new_session_id)
 }
 
 async fn resume_with_remote_control(
@@ -609,6 +798,7 @@ mod tests {
                 admin_secret: Some("test-secret".to_owned()),
                 allowed_origins: vec!["http://127.0.0.1:3036".to_owned()],
                 trust_local_network: false,
+                proxy_settings_path: Some("/cfg/proxy-settings.json".to_owned()),
             },
         )
     }
@@ -709,6 +899,82 @@ mod tests {
             app.oneshot(with_origin).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn spec(live: bool, flags: &[&str]) -> crate::scanner::LaunchSpec {
+        crate::scanner::LaunchSpec {
+            resume_id: "abcd1234-5678-90ab-cdef-1234567890ab".to_owned(),
+            cwd: Some("/home/x/proj".to_owned()),
+            respawn_flags: flags.iter().map(|s| s.to_string()).collect(),
+            name: Some("my-agent".to_owned()),
+            rc_name: None,
+            live,
+        }
+    }
+
+    #[test]
+    fn mode_plan_native_rc_strips_gateway_and_arms_rc() {
+        let s = spec(
+            true,
+            &[
+                "--settings",
+                "/cfg/proxy-settings.json",
+                "--agent",
+                "claude",
+                "--allow-dangerously-skip-permissions",
+                "--model",
+                "claude-sonnet-4-6",
+            ],
+        );
+        let plan = mode_plan(&s, "native-rc", "my-agent", Some("/cfg/proxy.json"), "claude").unwrap();
+        // resume + rc, proxy --settings stripped, other flags preserved.
+        assert_eq!(
+            plan.argv,
+            vec![
+                "--resume",
+                "abcd1234-5678-90ab-cdef-1234567890ab",
+                "--bg",
+                "--remote-control",
+                "my-agent",
+                "--agent",
+                "claude",
+                "--allow-dangerously-skip-permissions",
+                "--model",
+                "claude-sonnet-4-6",
+            ]
+        );
+        assert!(plan.env_unset.contains(&"ANTHROPIC_BASE_URL".to_owned()));
+        assert!(plan.env_unset.contains(&"CCP_ALIAS_PROVIDER".to_owned()));
+        assert!(!plan.argv.iter().any(|a| a == "--settings"));
+        assert_eq!(plan.stop_short_id.as_deref(), Some("abcd1234"));
+    }
+
+    #[test]
+    fn mode_plan_proxy_adds_settings_no_rc() {
+        let s = spec(false, &["--remote-control", "old-name", "--agent", "claude"]);
+        let plan = mode_plan(&s, "proxy", "x", Some("/cfg/proxy.json"), "claude").unwrap();
+        assert_eq!(
+            plan.argv,
+            vec![
+                "--resume",
+                "abcd1234-5678-90ab-cdef-1234567890ab",
+                "--bg",
+                "--settings",
+                "/cfg/proxy.json",
+                "--agent",
+                "claude",
+            ]
+        );
+        assert!(plan.env_unset.is_empty());
+        assert!(!plan.argv.iter().any(|a| a == "--remote-control"));
+        assert_eq!(plan.stop_short_id, None, "terminated session isn't stopped");
+    }
+
+    #[test]
+    fn mode_plan_proxy_without_settings_configured_errors() {
+        let s = spec(true, &[]);
+        assert!(mode_plan(&s, "proxy", "x", None, "claude").is_err());
+        assert!(mode_plan(&s, "teleport", "x", Some("/p"), "claude").is_err());
     }
 
     #[test]

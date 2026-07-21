@@ -142,6 +142,7 @@ fn main() -> Result<()> {
                             let value = value.trim();
                             value == "1" || value.eq_ignore_ascii_case("true")
                         }),
+                    proxy_settings_path: std::env::var("CCP_PROXY_SETTINGS_PATH").ok(),
                 },
                 std::future::pending::<()>(),
             ));
