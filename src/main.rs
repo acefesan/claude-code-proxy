@@ -30,6 +30,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Version,
+    /// Classify the sessions in CLAUDE_DIR (honors CLAUDE_DIR/HOST_PROC env) and
+    /// print the ScanResult as JSON. Enables offline smoke-testing of the
+    /// scanner's mode/RC/lineage logic against a synthetic fixture — no traffic.
+    Scan,
     Serve {
         #[arg(long)]
         port: Option<u16>,
@@ -95,6 +99,12 @@ fn main() -> Result<()> {
     });
 
     match commands {
+        Commands::Scan => {
+            let result =
+                claude_code_proxy::scanner::scan_sessions(&claude_code_proxy::scanner::ScanConfig::host());
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         Commands::Version => {
             println!("claude-code-proxy {}", VERSION);
             Ok(())
