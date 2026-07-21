@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -61,13 +61,22 @@ pub struct ScannedSession {
     pub result: Option<String>,
     /// Token spend recorded on the job, when available.
     pub tokens: Option<u64>,
-    /// True when the session was launched against this gateway.
+    /// True when the session routes inference through the gateway (a non-Anthropic
+    /// base URL). Determined from the effective `ANTHROPIC_BASE_URL`, not from the
+    /// `CCP_ALIAS_PROVIDER` marker, which can linger stale after a mode switch.
     pub managed: bool,
-    /// True when the session was launched with `--remote-control` (phone-steerable
-    /// via Anthropic's relay). Detected from the recorded launch/respawn flags.
+    /// True when the session *can* use Remote Control — i.e. it runs native
+    /// (first-party, direct to api.anthropic.com). A gateway-routed session never
+    /// can, regardless of flags, so this is false for it.
+    pub rc_capable: bool,
+    /// True when the session is actually Remote-Control armed: it carries the
+    /// `--remote-control` flag (or `remoteControlAtStartup`) AND is `rc_capable`.
     pub rc: bool,
     /// The Remote Control session name, when `--remote-control <name>` supplied one.
     pub rc_name: Option<String>,
+    /// The session this one was resumed from (its `resumeSessionId` / resume-mode
+    /// parent), so the dashboard can stitch a forked lineage into one session.
+    pub resume_of: Option<String>,
     pub route: ObservedRoute,
     pub source: String,
     pub evidence: Vec<String>,
@@ -190,9 +199,14 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
             continue;
         }
 
-        let evidence = routing_evidence(merged.environment.as_ref(), job, worker);
-        let managed = !evidence.is_empty();
+        let arrays = flag_arrays(worker, job);
+        // Mode hinges on the effective inference base URL, the same thing Claude
+        // Code's own RC gate checks — a non-Anthropic base URL means gateway mode
+        // (no RC possible); unset or api.anthropic.com means native (RC possible).
+        let base_url = effective_base_url(merged.environment.as_ref(), &arrays, worker, job);
+        let managed = base_url.as_deref().is_some_and(is_gateway_base_url);
         let has_metadata = merged.environment.is_some() || job.is_some() || worker.is_some();
+        let evidence = mode_evidence(base_url.as_deref(), managed);
         let route = if managed {
             ObservedRoute::Unknown
         } else if has_metadata {
@@ -230,7 +244,14 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
             state.as_deref(),
             string_at(&record, &["status"]).as_deref(),
         );
-        let (rc, rc_name) = remote_control(worker, job);
+        // Remote Control requires native mode. A gateway-routed session that
+        // carries the flag can never actually bridge, so report it honestly.
+        let rc_capable = !managed;
+        let (rc_flag, rc_name) = remote_control_flags(&arrays, worker);
+        let rc = rc_flag && rc_capable;
+        let resume_of = string_at_opt(job, &["resumeSessionId"])
+            .or_else(|| string_at_opt(worker, &["dispatch", "launch", "sessionId"]))
+            .filter(|parent| Some(parent.as_str()) != session_id.as_deref());
 
         let source = string_at_opt(worker, &["dispatch", "source"])
             .or_else(|| string_at_opt(job, &["template"]).map(normalize_kind))
@@ -241,11 +262,6 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
                     "unknown".to_owned()
                 }
             });
-        let fallback_evidence = match route {
-            ObservedRoute::Anthropic => Some("no Codex routing marker"),
-            ObservedRoute::Unknown => Some("insufficient metadata"),
-            ObservedRoute::Codex => None,
-        };
         sessions.push(ScannedSession {
             name,
             session_id,
@@ -261,19 +277,13 @@ pub fn scan_sessions(config: &ScanConfig) -> ScanResult {
             result,
             tokens,
             managed,
+            rc_capable,
             rc,
             rc_name,
+            resume_of,
             route,
             source,
-            evidence: if evidence.is_empty() {
-                vec![
-                    fallback_evidence
-                        .expect("non-Codex routes have fallback evidence")
-                        .to_owned(),
-                ]
-            } else {
-                evidence
-            },
+            evidence,
         });
     }
 
@@ -395,12 +405,21 @@ pub fn launch_spec(config: &ScanConfig, session_id: &str) -> Option<LaunchSpec> 
                 .get("pid")
                 .and_then(Value::as_u64)
                 .is_some_and(|pid| config.proc_dir.join(pid.to_string()).exists());
-            let (_, rc_name) = remote_control(Some(worker), None);
+            let (_, rc_name) = remote_control_flags(&flag_arrays(Some(worker), None), Some(worker));
+            let respawn_flags = {
+                let flags = string_array(worker.pointer("/dispatch/respawnFlags"));
+                if flags.is_empty() {
+                    // Resume-mode workers record their flags in launch.flagArgs.
+                    string_array(worker.pointer("/dispatch/launch/flagArgs"))
+                } else {
+                    flags
+                }
+            };
             return Some(LaunchSpec {
                 resume_id: session_id.to_owned(),
                 cwd: string_at_opt(Some(worker), &["dispatch", "cwd"])
                     .or_else(|| string_at_opt(Some(worker), &["cwd"])),
-                respawn_flags: string_array(worker.pointer("/dispatch/respawnFlags")),
+                respawn_flags,
                 name: string_at_opt(Some(worker), &["dispatch", "seed", "name"]),
                 rc_name,
                 live,
@@ -416,7 +435,7 @@ pub fn launch_spec(config: &ScanConfig, session_id: &str) -> Option<LaunchSpec> 
         if string_at(&job, &["sessionId"]).as_deref() != Some(session_id) {
             continue;
         }
-        let (_, rc_name) = remote_control(None, Some(&job));
+        let (_, rc_name) = remote_control_flags(&flag_arrays(None, Some(&job)), None);
         return Some(LaunchSpec {
             resume_id: string_at(&job, &["resumeSessionId"]).unwrap_or_else(|| session_id.to_owned()),
             cwd: string_at(&job, &["cwd"]),
@@ -520,59 +539,105 @@ fn read_environment(path: &Path) -> Option<BTreeMap<String, String>> {
     )
 }
 
-fn routing_evidence(
-    environment: Option<&BTreeMap<String, String>>,
-    job: Option<&Value>,
-    worker: Option<&Value>,
-) -> Vec<String> {
-    let mut evidence = BTreeSet::new();
-    if environment
-        .and_then(|env| env.get("CCP_ALIAS_PROVIDER"))
-        .is_some_and(|value| value == "codex")
-    {
-        evidence.insert("process env: CCP_ALIAS_PROVIDER=codex".to_owned());
-    }
-    if environment
-        .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
-        .is_some_and(|value| value.starts_with("http://127.0.0.1:18765"))
-    {
-        evidence.insert("process env: local Codex proxy".to_owned());
-    }
-    let launch = flatten(worker.and_then(|value| value.pointer("/dispatch/launch")));
-    let daemon_env = flatten(worker.and_then(|value| value.pointer("/dispatch/env")));
-    let job_flags = flatten(job.and_then(|value| value.get("respawnFlags")));
-    let provider_env = flatten(job.and_then(|value| value.get("providerEnv")));
-    if [&launch, &daemon_env, &job_flags, &provider_env]
-        .iter()
-        .any(|text| text.contains("claude-code-proxy-codex"))
-    {
-        evidence.insert("launch metadata: Codex settings".to_owned());
-    }
-    if [&daemon_env, &provider_env]
-        .iter()
-        .any(|text| text.contains("CCP_ALIAS_PROVIDER=codex"))
-    {
-        evidence.insert("launch metadata: Codex provider".to_owned());
-    }
-    evidence.into_iter().collect()
-}
-
-/// Detect whether a session was launched with `--remote-control` (making it
-/// steerable from the phone via Anthropic's relay), and recover the optional
-/// name argument. Reads the recorded launch/respawn flag arrays — the same
-/// metadata `claude` writes for every dispatched worker and job.
-fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<String>) {
-    let sources = [
+/// Every recorded launch/respawn flag array for a session, across the spellings
+/// `claude` uses: `dispatch.launch.args` (spawn mode), `dispatch.launch.flagArgs`
+/// (resume mode — previously missed), `dispatch.respawnFlags`, and the job's
+/// `respawnFlags`.
+fn flag_arrays<'a>(worker: Option<&'a Value>, job: Option<&'a Value>) -> Vec<&'a Vec<Value>> {
+    [
         worker.and_then(|value| value.pointer("/dispatch/launch/args")),
+        worker.and_then(|value| value.pointer("/dispatch/launch/flagArgs")),
         worker.and_then(|value| value.pointer("/dispatch/respawnFlags")),
         job.and_then(|value| value.get("respawnFlags")),
-    ];
-    let arrays: Vec<&Vec<Value>> = sources
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_array)
-        .collect();
-    for array in &arrays {
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_array)
+    .collect()
+}
+
+/// The value following `flag` in any recorded flag array (e.g. the path after
+/// `--settings`), ignoring a following token that is itself a flag.
+fn flag_value(arrays: &[&Vec<Value>], flag: &str) -> Option<String> {
+    for array in arrays {
+        if let Some(index) = array.iter().position(|item| item.as_str() == Some(flag)) {
+            if let Some(value) = array.get(index + 1).and_then(Value::as_str) {
+                if !value.starts_with("--") {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The inference base URL a session effectively uses, checked (in order) in its
+/// process env, its `--settings` file's `env` block, and recorded dispatch/
+/// provider env. This — not `CCP_ALIAS_PROVIDER`, which lingers stale across a
+/// mode switch — is what decides gateway vs native mode.
+fn effective_base_url(
+    environment: Option<&BTreeMap<String, String>>,
+    arrays: &[&Vec<Value>],
+    worker: Option<&Value>,
+    job: Option<&Value>,
+) -> Option<String> {
+    if let Some(url) = environment.and_then(|env| env.get("ANTHROPIC_BASE_URL")) {
+        return Some(url.clone());
+    }
+    if let Some(path) = flag_value(arrays, "--settings") {
+        if let Some(url) = settings_base_url(&path) {
+            return Some(url);
+        }
+    }
+    for env in [
+        worker.and_then(|value| value.pointer("/dispatch/env")),
+        job.and_then(|value| value.get("providerEnv")),
+    ] {
+        if let Some(url) = env
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str)
+        {
+            return Some(url.to_owned());
+        }
+    }
+    None
+}
+
+fn settings_base_url(path: &str) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("env")
+                .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// A base URL routes through the gateway when it is set to anything that is not
+/// Anthropic's first-party endpoint — matching Claude Code's own RC gate, which
+/// refuses Remote Control unless inference is direct to api.anthropic.com.
+fn is_gateway_base_url(url: &str) -> bool {
+    !url.trim().is_empty() && !url.contains("api.anthropic.com")
+}
+
+fn mode_evidence(base_url: Option<&str>, managed: bool) -> Vec<String> {
+    match (managed, base_url) {
+        (true, Some(url)) => vec![format!("gateway base URL: {url}")],
+        (false, Some(url)) => vec![format!("native base URL: {url}")],
+        (false, None) => vec!["native: no proxy base URL".to_owned()],
+        (true, None) => vec!["gateway".to_owned()],
+    }
+}
+
+/// Whether a session is armed for Remote Control per its launch metadata: the
+/// `--remote-control [name]` flag, or a `--settings` file with
+/// `remoteControlAtStartup: true`. This reports *intent*; callers gate it on
+/// native mode (rc_capable) to get actual steerability.
+fn remote_control_flags(arrays: &[&Vec<Value>], worker: Option<&Value>) -> (bool, Option<String>) {
+    for array in arrays {
         if let Some(index) = array
             .iter()
             .position(|item| item.as_str() == Some("--remote-control"))
@@ -595,16 +660,9 @@ fn remote_control(worker: Option<&Value>, job: Option<&Value>) -> (bool, Option<
     let started_at = worker
         .and_then(|worker| worker.get("startedAt"))
         .and_then(Value::as_u64);
-    for array in &arrays {
-        if let Some(index) = array
-            .iter()
-            .position(|item| item.as_str() == Some("--settings"))
-        {
-            if let Some(path) = array.get(index + 1).and_then(Value::as_str) {
-                if settings_arms_remote_control(path, started_at) {
-                    return (true, None);
-                }
-            }
+    if let Some(path) = flag_value(arrays, "--settings") {
+        if settings_arms_remote_control(&path, started_at) {
+            return (true, None);
         }
     }
     (false, None)
@@ -638,25 +696,6 @@ fn file_mtime_ms(path: &str) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|elapsed| elapsed.as_millis() as u64)
-}
-
-fn flatten(value: Option<&Value>) -> String {
-    match value {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(value)) => value.clone(),
-        Some(Value::Bool(value)) => value.to_string(),
-        Some(Value::Number(value)) => value.to_string(),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| flatten(Some(value)))
-            .collect::<Vec<_>>()
-            .join(" "),
-        Some(Value::Object(values)) => values
-            .iter()
-            .map(|(key, value)| format!("{key}={}", flatten(Some(value))))
-            .collect::<Vec<_>>()
-            .join(" "),
-    }
 }
 
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
@@ -729,11 +768,14 @@ mod tests {
             &config.claude_dir.join("sessions/101.json"),
             serde_json::json!({"pid":101,"sessionId":"interactive-id","cwd":"/home/me/project-a","kind":"interactive","name":"shell-name","status":"busy"}),
         );
+        // A gateway-routed session: its inference base URL points at the local
+        // proxy (not api.anthropic.com), which is what marks it managed — not the
+        // CCP_ALIAS_PROVIDER marker, which can linger stale after a mode switch.
         live(
             &config.proc_dir,
             101,
             &[
-                ("CCP_ALIAS_PROVIDER", "codex"),
+                ("ANTHROPIC_BASE_URL", "http://127.0.0.1:18765"),
                 ("ANTHROPIC_AUTH_TOKEN", "secret"),
             ],
         );
@@ -908,6 +950,60 @@ mod tests {
         assert_eq!(summarize(""), None);
         assert_eq!(summarize("   "), None);
         assert_eq!(summarize("  hello  \nsecond line"), Some("hello".to_owned()));
+    }
+
+    #[test]
+    fn stale_codex_env_without_base_url_is_native_and_rc_capable() {
+        // The bug from the portability test: a session resumed into native mode
+        // keeps a stale CCP_ALIAS_PROVIDER=codex env var but has no proxy base URL.
+        // It must read as native (managed=false) and RC-capable, not gateway.
+        let (_temp, config) = fixture();
+        write_json(
+            &config.claude_dir.join("sessions/121.json"),
+            serde_json::json!({"pid":121,"sessionId":"native-id","cwd":"/home/x/n","kind":"bg","name":"resumed-native"}),
+        );
+        live(&config.proc_dir, 121, &[("CCP_ALIAS_PROVIDER", "codex")]);
+        let s = &scan_sessions(&config).sessions[0];
+        assert!(!s.managed, "stale CCP marker without base URL must not read as gateway");
+        assert!(s.rc_capable, "native session must be RC-capable");
+        assert_eq!(s.route, ObservedRoute::Anthropic);
+    }
+
+    #[test]
+    fn remote_control_read_from_flagargs_and_gated_on_native() {
+        // Resume-mode dispatches store flags in launch.flagArgs (not args). RC must
+        // be detected there, and armed only when the session is native.
+        let (_temp, config) = fixture();
+        // Native resume with rc in flagArgs -> rc armed.
+        write_json(
+            &config.claude_dir.join("sessions/131.json"),
+            serde_json::json!({"pid":131,"sessionId":"n","jobId":"nj","kind":"bg","name":"native-rc"}),
+        );
+        // Gateway session ALSO flagged rc -> rc must be false (can't bridge).
+        let gw_settings = config.claude_dir.join("proxy-settings.json");
+        write_json(&gw_settings, serde_json::json!({"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:18765"}}));
+        write_json(
+            &config.claude_dir.join("sessions/132.json"),
+            serde_json::json!({"pid":132,"sessionId":"g","jobId":"gj","kind":"bg","name":"gateway-rc"}),
+        );
+        write_json(
+            &config.claude_dir.join("daemon/roster.json"),
+            serde_json::json!({"workers":{
+                "nj":{"dispatch":{"launch":{"mode":"resume","sessionId":"parent-abc","flagArgs":["--remote-control","native-rc"]}}},
+                "gj":{"dispatch":{"launch":{"flagArgs":["--remote-control","gateway-rc","--settings",gw_settings.to_str().unwrap()]}}}
+            }}),
+        );
+        live(&config.proc_dir, 131, &[]);
+        live(&config.proc_dir, 132, &[]);
+        let result = scan_sessions(&config);
+        let native = result.sessions.iter().find(|s| s.name == "native-rc").unwrap();
+        assert!(native.rc, "rc flag in flagArgs must be detected on a native session");
+        assert_eq!(native.rc_name.as_deref(), Some("native-rc"));
+        assert_eq!(native.resume_of.as_deref(), Some("parent-abc"), "resume lineage recorded");
+        let gateway = result.sessions.iter().find(|s| s.name == "gateway-rc").unwrap();
+        assert!(gateway.managed, "proxy base URL in --settings marks it gateway");
+        assert!(!gateway.rc_capable);
+        assert!(!gateway.rc, "a gateway session can never be rc-armed");
     }
 
     #[test]
